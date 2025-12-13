@@ -1,0 +1,45 @@
+name: Moodle scan (hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # כל שעה עגולה (UTC)
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 selenium
+
+      - name: Install Chromium + Chromedriver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver || true
+          sudo apt-get install -y chromium chromium-driver || true
+
+      - name: Run scan
+        env:
+          # נזין את אלה ב-Secrets בצעד הבא (לא לשים סיסמה בקוד/בריפו)
+          TAU_USERNAME: ${{ secrets.TAU_USERNAME }}
+          TAU_USER_ID: ${{ secrets.TAU_USER_ID }}
+          TAU_PASSWORD: ${{ secrets.TAU_PASSWORD }}
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # נריץ Headless בשרת
+          HEADLESS: "1"
+        run: |
+          python moodle_scan.py
