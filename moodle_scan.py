@@ -7,6 +7,7 @@ TAU Moodle scanner (GitHub Actions-ready):
 - Use HTTP Last-Modified as "שינוי אחרון"
 - Check only what changed since last run (stored in last_run.json)
 - If there are updates -> send Telegram message (no updates -> send nothing)
+- IMPORTANT: last_run.json is updated ONLY after successful Telegram send
 """
 
 from dataclasses import dataclass
@@ -272,10 +273,11 @@ def save_last_run(run_start: datetime) -> None:
 # TELEGRAM
 # ==========================
 
-def telegram_send(text: str) -> None:
+def telegram_send(text: str) -> bool:
+    """Return True if sent successfully, else False."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram secrets missing; skipping send.")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -283,21 +285,41 @@ def telegram_send(text: str) -> None:
         "text": text,
         "disable_web_page_preview": True,
     }
-    r = requests.post(url, json=payload, timeout=30)
-    print(r.text)
+
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+        # Telegram returns JSON {"ok": true/false, ...}
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+
+        if r.status_code == 200 and isinstance(data, dict) and data.get("ok") is True:
+            return True
+
+        print("Telegram send failed:", r.text)
+        return False
+    except Exception as e:
+        print("Telegram send exception:", repr(e))
+        return False
 
 
-def telegram_send_many(lines: list[str], header: str) -> None:
+def telegram_send_many(lines: list[str], header: str) -> bool:
     # Telegram limit ~4096 chars per message → split safely
     max_len = 3800
     chunk = header + "\n"
+    ok_all = True
+
     for line in lines:
         if len(chunk) + len(line) + 1 > max_len:
-            telegram_send(chunk)
+            ok_all = telegram_send(chunk) and ok_all
             chunk = header + "\n"
         chunk += line + "\n"
+
     if chunk.strip():
-        telegram_send(chunk)
+        ok_all = telegram_send(chunk) and ok_all
+
+    return ok_all
 
 
 # ==========================
@@ -310,9 +332,13 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")  # ✅ helps in headless
+
     if HEADLESS:
         options.add_argument("--headless=new")
-    return webdriver.Chrome(options=options)  # Selenium Manager will provide driver
+
+    # Selenium Manager will provide driver
+    return webdriver.Chrome(options=options)
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
@@ -550,16 +576,22 @@ def main():
         session = _session_from_selenium_cookies(driver)
         results = scan_all(session, courses, last_run)
 
-        # Update state even if no results (so next run checks only since now)
-        save_last_run(run_start)
-
         if not results:
+            # ✅ no updates -> advance state, and send nothing
+            save_last_run(run_start)
             print("No updates since last run. (No Telegram message will be sent.)")
             return
 
         lines = [_print_line(x) for x in results]
         header = f"📌 עדכונים במודל מאז {last_run.strftime('%d.%m.%Y %H:%M')} ({len(lines)}):"
-        telegram_send_many(lines, header)
+
+        # ✅ send first, only then save state
+        ok = telegram_send_many(lines, header)
+        if not ok:
+            raise RuntimeError("Telegram send failed. last_run.json will NOT be updated (so it will retry next run).")
+
+        save_last_run(run_start)
+        print("Telegram sent successfully; state updated.")
 
     finally:
         try:
