@@ -7,7 +7,7 @@ TAU Moodle scanner (GitHub Actions-ready):
 - Use HTTP Last-Modified as "שינוי אחרון"
 - Check only what changed since last run (stored in last_run.json)
 - If there are updates -> send Telegram message (no updates -> send nothing)
-- IMPORTANT: last_run.json is updated ONLY after successful Telegram send
+- If there is an error -> send Telegram alert with log link + traceback
 """
 
 from dataclasses import dataclass
@@ -18,6 +18,7 @@ import json
 import os
 import re
 import time
+import traceback
 
 import requests
 from selenium import webdriver
@@ -82,10 +83,7 @@ class FoundFile:
 # ==========================
 
 def _course_display_name(raw: str) -> str:
-    """
-    Convert '05092843 - אנליזה הרמונית' -> 'אנליזה הרמונית'
-    Keep others as-is.
-    """
+    """Convert '05092843 - אנליזה הרמונית' -> 'אנליזה הרמונית' (keep others as-is)."""
     s = (raw or "").strip()
     if " - " in s:
         left, right = s.split(" - ", 1)
@@ -229,7 +227,7 @@ def _normalize_link_for_print(original_link: str, pluginfile_link: str) -> str:
     return pluginfile_link
 
 
-def _print_line(item: FoundFile) -> str:
+def _format_line(item: FoundFile) -> str:
     return (
         f"{item.course_name_display}\t | "
         f"שם הקובץ: {item.file_name}\t | "
@@ -273,11 +271,10 @@ def save_last_run(run_start: datetime) -> None:
 # TELEGRAM
 # ==========================
 
-def telegram_send(text: str) -> bool:
-    """Return True if sent successfully, else False."""
+def telegram_send(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram secrets missing; skipping send.")
-        return False
+        return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -285,41 +282,46 @@ def telegram_send(text: str) -> bool:
         "text": text,
         "disable_web_page_preview": True,
     }
-
-    try:
-        r = requests.post(url, json=payload, timeout=30)
-        # Telegram returns JSON {"ok": true/false, ...}
-        try:
-            data = r.json()
-        except Exception:
-            data = None
-
-        if r.status_code == 200 and isinstance(data, dict) and data.get("ok") is True:
-            return True
-
-        print("Telegram send failed:", r.text)
-        return False
-    except Exception as e:
-        print("Telegram send exception:", repr(e))
-        return False
+    r = requests.post(url, json=payload, timeout=30)
+    print(r.text)
 
 
-def telegram_send_many(lines: list[str], header: str) -> bool:
+def telegram_send_many(lines: list[str], header: str) -> None:
     # Telegram limit ~4096 chars per message → split safely
     max_len = 3800
     chunk = header + "\n"
-    ok_all = True
-
     for line in lines:
         if len(chunk) + len(line) + 1 > max_len:
-            ok_all = telegram_send(chunk) and ok_all
+            telegram_send(chunk)
             chunk = header + "\n"
         chunk += line + "\n"
-
     if chunk.strip():
-        ok_all = telegram_send(chunk) and ok_all
+        telegram_send(chunk)
 
-    return ok_all
+
+def _github_run_url() -> str:
+    # Works inside GitHub Actions
+    server = os.environ.get("GITHUB_SERVER_URL", "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
+    if server and repo and run_id:
+        return f"{server}/{repo}/actions/runs/{run_id}"
+    return ""
+
+
+def telegram_send_error(title: str, err_text: str) -> None:
+    run_url = _github_run_url()
+    header = f"❌ {title}"
+    if run_url:
+        header += f"\n🔗 Logs: {run_url}"
+
+    # keep it short enough for Telegram
+    max_len = 3500
+    body = err_text.strip()
+    if len(body) > max_len:
+        body = body[:max_len] + "\n…(truncated)…"
+
+    telegram_send(header + "\n\n" + body)
 
 
 # ==========================
@@ -332,13 +334,9 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")  # ✅ helps in headless
-
     if HEADLESS:
         options.add_argument("--headless=new")
-
-    # Selenium Manager will provide driver
-    return webdriver.Chrome(options=options)
+    return webdriver.Chrome(options=options)  # Selenium Manager will provide driver
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
@@ -557,7 +555,7 @@ def scan_all(session: requests.Session, courses: list[tuple[str, str]], referenc
 
 
 def main():
-    # validate required secrets
+    # validate required secrets (fail fast, and notify)
     if not USERNAME or not USER_ID or not PASSWORD:
         raise SystemExit("Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD")
 
@@ -576,22 +574,16 @@ def main():
         session = _session_from_selenium_cookies(driver)
         results = scan_all(session, courses, last_run)
 
+        # Update state even if no results (so next run checks only since now)
+        save_last_run(run_start)
+
         if not results:
-            # ✅ no updates -> advance state, and send nothing
-            save_last_run(run_start)
             print("No updates since last run. (No Telegram message will be sent.)")
             return
 
-        lines = [_print_line(x) for x in results]
+        lines = [_format_line(x) for x in results]
         header = f"📌 עדכונים במודל מאז {last_run.strftime('%d.%m.%Y %H:%M')} ({len(lines)}):"
-
-        # ✅ send first, only then save state
-        ok = telegram_send_many(lines, header)
-        if not ok:
-            raise RuntimeError("Telegram send failed. last_run.json will NOT be updated (so it will retry next run).")
-
-        save_last_run(run_start)
-        print("Telegram sent successfully; state updated.")
+        telegram_send_many(lines, header)
 
     finally:
         try:
@@ -601,4 +593,17 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # ✅ NEW: on any error -> send Telegram alert + fail the job
+    try:
+        main()
+    except SystemExit as e:
+        # SystemExit is often used for config/secrets errors
+        msg = f"SystemExit: {e}"
+        print(msg)
+        telegram_send_error("Moodle scan failed (SystemExit)", msg)
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb)
+        telegram_send_error("Moodle scan failed (Exception)", tb)
+        raise
