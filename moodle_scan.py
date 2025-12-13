@@ -7,7 +7,7 @@ TAU Moodle scanner (GitHub Actions-ready):
 - Use HTTP Last-Modified as "שינוי אחרון"
 - Check only what changed since last run (stored in last_run.json)
 - If there are updates -> send Telegram message (no updates -> send nothing)
-- If there is an error -> send Telegram alert with log link + traceback
+- If there is an error -> send Telegram message with the GitHub Actions run link + traceback
 """
 
 from dataclasses import dataclass
@@ -56,7 +56,8 @@ STATE_FILE = "last_run.json"  # will be created/updated in repo
 # ==========================
 # SECRETS (from GitHub Actions)
 # ==========================
-
+# IMPORTANT: do NOT hardcode secrets here.
+# Put them in GitHub -> Settings -> Secrets and variables -> Actions -> Secrets.
 USERNAME = os.environ.get("MOODLE_USERNAME", "")
 USER_ID = os.environ.get("MOODLE_USER_ID", "")
 PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
@@ -83,7 +84,10 @@ class FoundFile:
 # ==========================
 
 def _course_display_name(raw: str) -> str:
-    """Convert '05092843 - אנליזה הרמונית' -> 'אנליזה הרמונית' (keep others as-is)."""
+    """
+    Convert '05092843 - אנליזה הרמונית' -> 'אנליזה הרמונית'
+    Keep others as-is.
+    """
     s = (raw or "").strip()
     if " - " in s:
         left, right = s.split(" - ", 1)
@@ -187,7 +191,7 @@ def _extract_activity_links_from_course_html(html: str) -> tuple[set[str], set[s
 
 
 def _resolve_resource_view_to_file(session: requests.Session, view_url: str) -> list[str]:
-    urls = []
+    urls: list[str] = []
 
     if "redirect=" not in view_url:
         joiner = "&" if "?" in view_url else "?"
@@ -299,29 +303,13 @@ def telegram_send_many(lines: list[str], header: str) -> None:
         telegram_send(chunk)
 
 
-def _github_run_url() -> str:
-    # Works inside GitHub Actions
-    server = os.environ.get("GITHUB_SERVER_URL", "").strip()
-    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
-    run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
-    if server and repo and run_id:
-        return f"{server}/{repo}/actions/runs/{run_id}"
+def github_run_url() -> str:
+    # https://github.com/<owner>/<repo>/actions/runs/<run_id>
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if repo and run_id:
+        return f"https://github.com/{repo}/actions/runs/{run_id}"
     return ""
-
-
-def telegram_send_error(title: str, err_text: str) -> None:
-    run_url = _github_run_url()
-    header = f"❌ {title}"
-    if run_url:
-        header += f"\n🔗 Logs: {run_url}"
-
-    # keep it short enough for Telegram
-    max_len = 3500
-    body = err_text.strip()
-    if len(body) > max_len:
-        body = body[:max_len] + "\n…(truncated)…"
-
-    telegram_send(header + "\n\n" + body)
 
 
 # ==========================
@@ -336,49 +324,88 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     if HEADLESS:
         options.add_argument("--headless=new")
-    return webdriver.Chrome(options=options)  # Selenium Manager will provide driver
+    # Selenium Manager will download/install matching driver automatically on GitHub runners
+    return webdriver.Chrome(options=options)
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
+    """
+    Return the first element that is BOTH displayed and enabled.
+    (Prevents picking hidden/overlayed fields that cause ElementNotInteractableException)
+    """
     for v in values:
         try:
-            return driver.find_element(by, v)
+            el = driver.find_element(by, v)
+            if el.is_displayed() and el.is_enabled():
+                return el
         except Exception:
             continue
     return None
 
 
 def maybe_login_nidp(driver: webdriver.Chrome) -> None:
+    """
+    Fill the TAU NIDP SSO form if it appears.
+    Robust against multiple possible field IDs AND hidden duplicates.
+    """
     wait = WebDriverWait(driver, WAIT_SEC)
 
     user_ids = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
     pid_ids  = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
     pass_ids = ["Ecom_Password", "Ecom_Pass", "password", "pass"]
 
-    def any_login_field_present(d):
+    def any_visible_login_field_present(d):
         return (_find_any(d, By.ID, user_ids) is not None) or (_find_any(d, By.ID, pass_ids) is not None)
 
     try:
-        wait.until(any_login_field_present)
+        wait.until(any_visible_login_field_present)
     except Exception:
+        # no login form detected
         return
+
+    def _safe_fill(el, value: str):
+        # scroll + focus
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        except Exception:
+            pass
+
+        try:
+            el.click()
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].click();", el)
+            except Exception:
+                pass
+
+        # clear via keyboard (more reliable than clear())
+        try:
+            el.send_keys(Keys.CONTROL, "a")
+            el.send_keys(Keys.BACKSPACE)
+            el.send_keys(value)
+            return
+        except Exception:
+            # last resort: set via JS + fire input/change
+            driver.execute_script(
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+                "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                el, value
+            )
 
     user_field = _find_any(driver, By.ID, user_ids)
     if user_field:
-        user_field.clear()
-        user_field.send_keys(USERNAME)
+        _safe_fill(user_field, USERNAME)
 
     pid_field = _find_any(driver, By.ID, pid_ids)
     if pid_field:
-        pid_field.clear()
-        pid_field.send_keys(USER_ID)
+        _safe_fill(pid_field, USER_ID)
 
     pass_field = _find_any(driver, By.ID, pass_ids)
     if not pass_field:
         return
 
-    pass_field.clear()
-    pass_field.send_keys(PASSWORD)
+    _safe_fill(pass_field, PASSWORD)
     pass_field.send_keys(Keys.RETURN)
 
 
@@ -429,6 +456,10 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
 
 
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
+    """
+    Go to MyCourses.
+    If guest access -> click login -> complete SSO -> back to MyCourses.
+    """
     wait = WebDriverWait(driver, WAIT_SEC)
     driver.get(MY_COURSES_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -463,14 +494,14 @@ def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.mycourses_coursename")))
 
     links = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
-    courses = []
+    courses: list[tuple[str, str]] = []
     for a in links:
         name = (a.text or "").strip()
         href = a.get_attribute("href")
         if name and href and "course/view.php?id=" in href:
             courses.append((name, href))
 
-    uniq = []
+    uniq: list[tuple[str, str]] = []
     seen = set()
     for n, u in courses:
         if u not in seen:
@@ -554,8 +585,12 @@ def scan_all(session: requests.Session, courses: list[tuple[str, str]], referenc
     return found
 
 
+# ==========================
+# ENTRY
+# ==========================
+
 def main():
-    # validate required secrets (fail fast, and notify)
+    # validate required secrets
     if not USERNAME or not USER_ID or not PASSWORD:
         raise SystemExit("Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD")
 
@@ -565,6 +600,8 @@ def main():
     driver = build_driver()
     try:
         driver.get(LOGIN_URL)
+
+        # if we see NIDP form -> fill; otherwise might already be logged in
         maybe_login_nidp(driver)
         ensure_on_moodle(driver)
 
@@ -593,17 +630,21 @@ def main():
 
 
 if __name__ == "__main__":
-    # ✅ NEW: on any error -> send Telegram alert + fail the job
     try:
         main()
-    except SystemExit as e:
-        # SystemExit is often used for config/secrets errors
-        msg = f"SystemExit: {e}"
-        print(msg)
-        telegram_send_error("Moodle scan failed (SystemExit)", msg)
-        raise
-    except Exception:
+    except Exception as e:
+        # send error to Telegram (very important)
+        run_link = github_run_url()
         tb = traceback.format_exc()
-        print(tb)
-        telegram_send_error("Moodle scan failed (Exception)", tb)
+
+        msg = "❌ Moodle scan failed (Exception)\n"
+        if run_link:
+            msg += f"🔗 Logs: {run_link}\n\n"
+        msg += tb
+
+        # Telegram has length limits; clip a bit
+        if len(msg) > 3800:
+            msg = msg[:3800] + "\n...\n(Traceback clipped)"
+
+        telegram_send(msg)
         raise
