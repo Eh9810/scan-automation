@@ -1,0 +1,49 @@
+name: Moodle Scan Hourly
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # כל שעה עגולה (UTC)
+  workflow_dispatch:       # מאפשר להריץ ידנית
+
+permissions:
+  contents: write          # כדי לעדכן last_run.json ולבצע commit
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install selenium requests beautifulsoup4
+
+      - name: Run scanner
+        env:
+          MOODLE_USERNAME: ${{ secrets.MOODLE_USERNAME }}
+          MOODLE_USER_ID: ${{ secrets.MOODLE_USER_ID }}
+          MOODLE_PASSWORD: ${{ secrets.MOODLE_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python moodle_scan.py
+
+      - name: Commit updated state (last_run.json) if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git status --porcelain | grep -q "last_run.json"; then
+            git add last_run.json
+            git commit -m "Update last_run state"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
