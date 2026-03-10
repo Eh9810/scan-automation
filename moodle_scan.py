@@ -45,6 +45,8 @@ from selenium.webdriver.support import expected_conditions as EC
 
 LOGIN_URL = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential&sid=0"
 MOODLE_ROOT_URL = "https://moodle.tau.ac.il/"
+# DASHBOARD_URL is the main dashboard where <select class="cal_courses_flt"> lives
+DASHBOARD_URL = "https://moodle.tau.ac.il/"
 MY_OVERVIEW_URL = "https://moodle.tau.ac.il/my/"
 MY_COURSES_CLASSIC_URL = "https://moodle.tau.ac.il/my/courses.php"
 MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
@@ -617,6 +619,54 @@ def _get_courses_via_ajax(session: requests.Session, sesskey: str, referer: str)
     return found
 
 
+def _get_courses_from_calendar_select(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    courses: list[tuple[str, str]] = []
+    try:
+        WebDriverWait(driver, WAIT_SEC).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "select.cal_courses_flt"))
+        )
+        time.sleep(2)
+        select_el = driver.find_element(By.CSS_SELECTOR, "select.cal_courses_flt")
+        options = select_el.find_elements(By.TAG_NAME, "option")
+        for opt in options:
+            try:
+                val = opt.get_attribute("value")
+                if not val or val == "1":
+                    continue
+                name = (opt.text or "").strip()
+                url = f"{MOODLE_ROOT_URL}course/view.php?id={val}"
+                if name:
+                    courses.append((name, url))
+            except Exception as opt_e:
+                print(f"Warning: skipped calendar select option: {opt_e}")
+                continue
+    except Exception as e:
+        print(f"Warning: could not read calendar select: {e}")
+    return courses
+
+
+def _get_courses_from_my_courses_page(session: requests.Session) -> list[tuple[str, str]]:
+    html = _http_get_html(session, MY_COURSES_CLASSIC_URL)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    courses: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for a in soup.select("a[href*='course/view.php?id=']"):
+        href = a.get("href", "")
+        if not href:
+            continue
+        href = _normalize_url(href)
+        if href in seen:
+            continue
+        name = (a.get_text(" ", strip=True) or "").strip()
+        if not name or len(name) < 3:
+            continue
+        seen.add(href)
+        courses.append((name, href))
+    return courses
+
+
 def _get_courses_from_rendered_driver_page(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     try:
         html = driver.page_source
@@ -640,33 +690,83 @@ def _get_first_accessible_moodle_html(session: requests.Session) -> tuple[str | 
 
 
 def get_courses_after_login(driver: webdriver.Chrome) -> list[tuple[str, str]]:
-    usable_driver_html = ""
-    usable_driver_url = None
+    # Strategy 0: Navigate to main dashboard — this is where cal_courses_flt lives
+    print(f"Navigating to dashboard: {DASHBOARD_URL}")
+    try:
+        driver.get(DASHBOARD_URL)
+        WebDriverWait(driver, WAIT_SEC).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(1.2)
+    except Exception as e:
+        print(f"DEBUG failed navigating to dashboard: {e}")
 
+    # Strategy 1: Read calendar <select class="cal_courses_flt"> via Selenium (with proper wait)
+    courses = _get_courses_from_calendar_select(driver)
+    if courses:
+        print(f"DEBUG got {len(courses)} courses from calendar select (Selenium)")
+        save_course_cache(courses)
+        return courses
+
+    # Strategy 2: Read calendar <select> via BS4 on page_source
+    print("Calendar select via Selenium empty — trying BS4 on page source...")
+    try:
+        page_source = driver.page_source
+        soup = BeautifulSoup(page_source, "html.parser")
+        select_el = soup.select_one("select.cal_courses_flt")
+        if select_el:
+            bs4_courses: list[tuple[str, str]] = []
+            for opt in select_el.find_all("option"):
+                val = opt.get("value", "")
+                if not val or val == "1":
+                    continue
+                name = (opt.get_text(" ", strip=True) or "").strip()
+                url = f"{MOODLE_ROOT_URL}course/view.php?id={val}"
+                if name:
+                    bs4_courses.append((name, url))
+            if bs4_courses:
+                print(f"DEBUG got {len(bs4_courses)} courses from calendar select (BS4)")
+                save_course_cache(bs4_courses)
+                return bs4_courses
+            print("Calendar select via BS4: found 0 options")
+        else:
+            print("Fallback BS4: <select class='cal_courses_flt'> NOT found in page source.")
+    except Exception as e:
+        print(f"Warning: BS4 calendar select fallback failed: {e}")
+
+    # Strategy 3: Try _get_courses_from_my_courses_page via requests session
+    session = _session_from_selenium_cookies(driver)
+    courses = _get_courses_from_my_courses_page(session)
+    if courses:
+        print(f"DEBUG got {len(courses)} courses from my/courses.php (requests)")
+        save_course_cache(courses)
+        return courses
+
+    # Strategy 4: Parse dashboard page_source for a[href*="course/view.php?id="] links
+    print("BS4 also empty — waiting for dynamic JS course links...")
+    try:
+        page_source = driver.page_source
+        link_courses = _extract_course_links_from_html(page_source)
+        if link_courses:
+            print(f"DEBUG got {len(link_courses)} courses from dashboard page_source links")
+            save_course_cache(link_courses)
+            return link_courses
+    except Exception as e:
+        print(f"DEBUG failed parsing page_source links: {e}")
+
+    # Strategy 5: Try other Moodle page candidates
     for url in MOODLE_PAGE_CANDIDATES:
+        if url == DASHBOARD_URL:
+            continue
         ok, html = _try_open_moodle_page_in_driver(driver, url)
         if ok:
-            usable_driver_html = html
-            usable_driver_url = url
-            break
+            page_courses = _extract_course_links_from_html(html)
+            if page_courses:
+                print(f"DEBUG got {len(page_courses)} courses from page {url}")
+                save_course_cache(page_courses)
+                return page_courses
 
-    if usable_driver_html:
-        courses = _extract_course_links_from_html(usable_driver_html)
-        if courses:
-            print(f"DEBUG got {len(courses)} courses directly from rendered driver page {usable_driver_url}")
-            save_course_cache(courses)
-            return courses
-
-    session = _session_from_selenium_cookies(driver)
-
+    # Strategy 6: Moodle AJAX API via requests session
     html_url, html = _get_first_accessible_moodle_html(session)
     if html:
-        courses = _extract_course_links_from_html(html)
-        if courses:
-            print(f"DEBUG got {len(courses)} courses directly from requests HTML {html_url}")
-            save_course_cache(courses)
-            return courses
-
         sesskey = _extract_sesskey_from_html(html)
         if sesskey:
             print(f"DEBUG extracted sesskey from {html_url}")
@@ -678,21 +778,48 @@ def get_courses_after_login(driver: webdriver.Chrome) -> list[tuple[str, str]]:
         else:
             print("DEBUG could not extract sesskey from usable Moodle HTML")
 
-    courses = _get_courses_from_rendered_driver_page(driver)
-    if courses:
-        print(f"DEBUG got {len(courses)} courses from late driver parse")
-        save_course_cache(courses)
-        return courses
+    # Strategy 7: Wait for dynamic JS links (a.mycourses_coursename) as last resort
+    try:
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "a.mycourses_coursename"))
+        )
+        elements = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
+        dyn_courses: list[tuple[str, str]] = []
+        for el in elements:
+            href = el.get_attribute("href") or ""
+            name = (el.text or "").strip()
+            if href and name and "course/view.php?id=" in href:
+                dyn_courses.append((name, href))
+        if dyn_courses:
+            print(f"DEBUG got {len(dyn_courses)} courses from dynamic JS links")
+            save_course_cache(dyn_courses)
+            return dyn_courses
+    except Exception as e:
+        print(f"DEBUG strategy 7 (dynamic JS links) failed: {e}")
 
+    # Fallback: use cached course list
     cached = load_course_cache()
     if cached:
         print(f"DEBUG using cached course list ({len(cached)} courses)")
         return cached
 
+    print("Total unique courses: 0")
+
+    # All strategies exhausted — save diagnostic info and raise
+    try:
+        driver.save_screenshot("debug_screenshot.png")
+        print("  Saved debug_screenshot.png")
+    except Exception:
+        pass
+    try:
+        print(f"  current_url: {driver.current_url}")
+        print(f"  page_source snippet:\n{driver.page_source[:3000]}")
+    except Exception:
+        pass
     _debug_dump_page(driver, "debug_no_courses")
     raise RuntimeError(
-        "Could not retrieve course list after SSO. "
-        "All Moodle landing pages were either blocked or returned no parsable course data."
+        "No courses found after login. "
+        "All strategies for course retrieval failed."
     )
 
 
@@ -878,6 +1005,13 @@ def main() -> None:
             print(f"DEBUG course {i}: {name} -> {url}")
 
         session = _session_from_selenium_cookies(driver)
+
+        # HTTP fallback if Selenium gave 0 courses
+        if not courses:
+            courses = _get_courses_from_my_courses_page(session)
+            if courses:
+                print(f"DEBUG HTTP fallback got {len(courses)} courses from my/courses.php")
+
         results = scan_all(session, courses, last_run)
 
         save_last_run(run_start)
