@@ -56,8 +56,6 @@ STATE_FILE = "last_run.json"  # will be created/updated in repo
 # ==========================
 # SECRETS (from GitHub Actions)
 # ==========================
-# IMPORTANT: do NOT hardcode secrets here.
-# Put them in GitHub -> Settings -> Secrets and variables -> Actions -> Secrets.
 USERNAME = os.environ.get("MOODLE_USERNAME", "")
 USER_ID = os.environ.get("MOODLE_USER_ID", "")
 PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
@@ -84,10 +82,6 @@ class FoundFile:
 # ==========================
 
 def _course_display_name(raw: str) -> str:
-    """
-    Convert '05092843 - אנליזה הרמונית' -> 'אנליזה הרמונית'
-    Keep others as-is.
-    """
     s = (raw or "").strip()
     if " - " in s:
         left, right = s.split(" - ", 1)
@@ -240,12 +234,45 @@ def _format_line(item: FoundFile) -> str:
     )
 
 
+def _debug_dump_page(driver: webdriver.Chrome, prefix: str = "debug") -> None:
+    try:
+        current_url = driver.current_url
+    except Exception:
+        current_url = "<unknown>"
+
+    try:
+        title = driver.title
+    except Exception:
+        title = "<unknown>"
+
+    try:
+        page_source = driver.page_source
+    except Exception:
+        page_source = "<cannot-read-page-source>"
+
+    print(f"DEBUG {prefix} current_url: {current_url}")
+    print(f"DEBUG {prefix} title: {title}")
+    print(f"DEBUG {prefix} page source snippet:\n{page_source[:5000]}")
+
+    try:
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(page_source)
+        print(f"DEBUG saved HTML to {prefix}.html")
+    except Exception as e:
+        print(f"DEBUG failed saving HTML: {e}")
+
+    try:
+        driver.save_screenshot(f"{prefix}.png")
+        print(f"DEBUG saved screenshot to {prefix}.png")
+    except Exception as e:
+        print(f"DEBUG failed saving screenshot: {e}")
+
+
 # ==========================
 # STATE (last run)
 # ==========================
 
 def load_last_run() -> datetime:
-    # default: last hour (so first run won't spam months)
     fallback = datetime.now(TZ_IL) - timedelta(hours=1)
 
     if not os.path.exists(STATE_FILE):
@@ -291,7 +318,6 @@ def telegram_send(text: str) -> None:
 
 
 def telegram_send_many(lines: list[str], header: str) -> None:
-    # Telegram limit ~4096 chars per message → split safely
     max_len = 3800
     chunk = header + "\n"
     for line in lines:
@@ -304,7 +330,6 @@ def telegram_send_many(lines: list[str], header: str) -> None:
 
 
 def github_run_url() -> str:
-    # https://github.com/<owner>/<repo>/actions/runs/<run_id>
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     if repo and run_id:
@@ -322,17 +347,13 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1600,2200")
     if HEADLESS:
         options.add_argument("--headless=new")
-    # Selenium Manager will download/install matching driver automatically on GitHub runners
     return webdriver.Chrome(options=options)
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
-    """
-    Return the first element that is BOTH displayed and enabled.
-    (Prevents picking hidden/overlayed fields that cause ElementNotInteractableException)
-    """
     for v in values:
         try:
             el = driver.find_element(by, v)
@@ -344,14 +365,10 @@ def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
 
 
 def maybe_login_nidp(driver: webdriver.Chrome) -> None:
-    """
-    Fill the TAU NIDP SSO form if it appears.
-    Robust against multiple possible field IDs AND hidden duplicates.
-    """
     wait = WebDriverWait(driver, WAIT_SEC)
 
     user_ids = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
-    pid_ids  = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
+    pid_ids = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
     pass_ids = ["Ecom_Password", "Ecom_Pass", "password", "pass"]
 
     def any_visible_login_field_present(d):
@@ -360,11 +377,9 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
     try:
         wait.until(any_visible_login_field_present)
     except Exception:
-        # no login form detected
         return
 
     def _safe_fill(el, value: str):
-        # scroll + focus
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         except Exception:
@@ -378,14 +393,12 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
             except Exception:
                 pass
 
-        # clear via keyboard (more reliable than clear())
         try:
             el.send_keys(Keys.CONTROL, "a")
             el.send_keys(Keys.BACKSPACE)
             el.send_keys(value)
             return
         except Exception:
-            # last resort: set via JS + fire input/change
             driver.execute_script(
                 "arguments[0].value = arguments[1];"
                 "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
@@ -432,6 +445,7 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
         "#usernavigation a[href*='/login/index.php']",
         "a[href='https://moodle.tau.ac.il/login/index.php']",
         "a[href*='moodle.tau.ac.il/login/index.php']",
+        "a[href*='/auth/saml2/login.php']",
     ]
 
     for sel in selectors:
@@ -444,11 +458,13 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
             pass
 
     try:
-        els = driver.find_elements(By.XPATH, "//a[contains(normalize-space(.), 'התחבר')]")
-        for el in els:
-            if el.is_displayed():
-                driver.execute_script("arguments[0].click();", el)
-                return True
+        texts = ["התחבר", "כניסה", "Login", "Sign in"]
+        for txt in texts:
+            els = driver.find_elements(By.XPATH, f"//a[contains(normalize-space(.), '{txt}')]")
+            for el in els:
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    return True
     except Exception:
         pass
 
@@ -459,81 +475,117 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     """
     Go to MyCourses.
     If guest access -> click login -> complete SSO -> back to MyCourses.
-    Robust to both old and new MyCourses UI.
+    Adds debug dump before failing.
     """
     wait = WebDriverWait(driver, WAIT_SEC)
     driver.get(MY_COURSES_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(0.8)
+    time.sleep(1.0)
 
-    # If we are guest, click "login" and go through SSO.
     if click_login_if_guest(driver):
-        time.sleep(1.2)
+        time.sleep(1.5)
 
         if "nidp.tau.ac.il" in driver.current_url.lower():
             maybe_login_nidp(driver)
             ensure_on_moodle(driver)
 
         driver.get(MY_COURSES_URL)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(1.0)
 
     def courses_or_guest(d):
-        """
-        Condition for WebDriverWait:
-        - Either we see the old-style 'a.mycourses_coursename'
-        - Or we see any course link to /course/view.php?id=... on /local/mycourses/
-        - Or the page clearly says 'guest access'
-        """
+        cur_url = d.current_url.lower()
+        page_html = d.page_source
+
         # Old layout
         if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
             return True
 
-        # New layout: React-based mycourses, look for course links
-        cur_url = d.current_url.lower()
+        # New layout - any course/view link
         if "local/mycourses" in cur_url:
             links = d.find_elements(By.CSS_SELECTOR, "a[href*='/course/view.php?id=']")
             if links:
                 return True
 
-        # Guest indicators (Hebrew/English)
-        page_html = d.page_source
-        guest_markers = ["גישת אורחים", "Guest access", "אורח במערכת"]
+        # Sometimes course cards are rendered with other links/classes
+        if "local/mycourses" in cur_url:
+            if "course/view.php?id=" in page_html:
+                return True
+
+        # Guest indicators
+        guest_markers = [
+            "גישת אורחים",
+            "Guest access",
+            "אורח במערכת",
+            "You are logged in as a guest",
+        ]
         if any(g in page_html for g in guest_markers):
+            return True
+
+        # Login indicators - useful to stop waiting if we got stuck back on login
+        login_markers = [
+            "Ecom_User_ID",
+            "Ecom_Password",
+            "הזדהות אוניברסיטאית",
+            "שם משתמש/ת",
+            "מספר זהות",
+        ]
+        if any(g in page_html for g in login_markers):
             return True
 
         return False
 
-    wait.until(courses_or_guest)
+    try:
+        wait.until(courses_or_guest)
+    except Exception:
+        _debug_dump_page(driver, "debug_before_wait")
+        raise
 
-    # If after all that we are still guest – treat as error.
-    if driver.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
+    # If we landed back on login page, fail with useful debug
+    page_html = driver.page_source
+    login_markers = [
+        "Ecom_User_ID",
+        "Ecom_Password",
+        "הזדהות אוניברסיטאית",
+        "שם משתמש/ת",
+        "מספר זהות",
+    ]
+    if any(m in page_html for m in login_markers):
+        _debug_dump_page(driver, "debug_login_detected")
+        raise RuntimeError("Reached Moodle flow but ended up back on TAU login page instead of MyCourses.")
+
+    guest_markers = [
+        "גישת אורחים",
+        "Guest access",
+        "אורח במערכת",
+        "You are logged in as a guest",
+    ]
+    if any(g in page_html for g in guest_markers):
+        _debug_dump_page(driver, "debug_guest_detected")
         raise RuntimeError("Still guest access on MyCourses; SSO did not complete automatically.")
 
 
 def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
-    """
-    Return list of (course_name_raw, course_url) from MyCourses.
-    Supports both old (a.mycourses_coursename) and new layout
-    (generic a[href*='/course/view.php?id=']).
-    """
     ensure_logged_in_moodle(driver)
 
     wait = WebDriverWait(driver, WAIT_SEC)
 
     def course_links_present(d):
-        # Old layout
         if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
             return True
-
-        # New layout on /local/mycourses/
         if "local/mycourses" in d.current_url.lower():
             if d.find_elements(By.CSS_SELECTOR, "a[href*='/course/view.php?id=']"):
                 return True
-
+            if "course/view.php?id=" in d.page_source:
+                return True
         return False
 
-    wait.until(course_links_present)
+    try:
+        wait.until(course_links_present)
+    except Exception:
+        _debug_dump_page(driver, "debug_get_courses_wait")
+        raise
 
-    # Collect links from both selectors
     links_elems = []
     try:
         links_elems.extend(driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"))
@@ -550,18 +602,28 @@ def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
         try:
             name = (a.text or "").strip()
             href = a.get_attribute("href")
-            if name and href and "course/view.php?id=" in href:
+            if href and "course/view.php?id=" in href:
+                if not name:
+                    name = href
                 courses.append((name, href))
         except Exception:
             continue
 
-    # Remove duplicates by URL
     uniq: list[tuple[str, str]] = []
     seen = set()
     for n, u in courses:
         if u not in seen:
             uniq.append((n, u))
             seen.add(u)
+
+    print(f"DEBUG collected {len(uniq)} course links")
+    for idx, (n, u) in enumerate(uniq[:20], start=1):
+        print(f"DEBUG course {idx}: {n} -> {u}")
+
+    if not uniq:
+        _debug_dump_page(driver, "debug_no_courses_found")
+        raise RuntimeError("No course links were found on MyCourses page.")
+
     return uniq
 
 
@@ -645,7 +707,6 @@ def scan_all(session: requests.Session, courses: list[tuple[str, str]], referenc
 # ==========================
 
 def main():
-    # validate required secrets
     if not USERNAME or not USER_ID or not PASSWORD:
         raise SystemExit("Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD")
 
@@ -656,7 +717,6 @@ def main():
     try:
         driver.get(LOGIN_URL)
 
-        # if we see NIDP form -> fill; otherwise might already be logged in
         maybe_login_nidp(driver)
         ensure_on_moodle(driver)
 
@@ -666,7 +726,6 @@ def main():
         session = _session_from_selenium_cookies(driver)
         results = scan_all(session, courses, last_run)
 
-        # Update state even if no results (so next run checks only since now)
         save_last_run(run_start)
 
         if not results:
@@ -687,8 +746,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        # send error to Telegram (very important)
+    except Exception:
         run_link = github_run_url()
         tb = traceback.format_exc()
 
@@ -697,7 +755,6 @@ if __name__ == "__main__":
             msg += f"🔗 Logs: {run_link}\n\n"
         msg += tb
 
-        # Telegram has length limits; clip a bit
         if len(msg) > 3800:
             msg = msg[:3800] + "\n...\n(Traceback clipped)"
 
