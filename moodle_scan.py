@@ -3,13 +3,13 @@
 TAU Moodle scanner (GitHub Actions-ready)
 
 Flow:
-1. Open https://moodle.tau.ac.il/local/mycourses/
-2. If guest -> click "התחבר/י" from Moodle
-3. Let Moodle initiate the SSO flow
-4. Fill NIDP credentials
-5. Wait until we are truly logged in to Moodle
-6. Scan course pages for updated files
-7. Send Telegram only on updates / errors
+1) Open TAU NIDP login page
+2) Fill credentials and submit
+3) Only after NIDP login is done, try to establish Moodle session
+4) Reach My Courses / another Moodle landing page with real logged-in markers
+5) Extract course links
+6) Scan course pages for updated files
+7) Send Telegram only on updates / errors
 """
 
 from dataclasses import dataclass
@@ -24,10 +24,10 @@ import traceback
 
 import requests
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -46,14 +46,26 @@ except ImportError:
 # CONFIG
 # ==========================
 
-MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
+LOGIN_URL = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential&sid=0"
+
 MOODLE_LOGIN_URL = "https://moodle.tau.ac.il/login/index.php"
+MOODLE_SAML_URL = "https://moodle.tau.ac.il/auth/saml2/login.php"
+MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
+MY_URL = "https://moodle.tau.ac.il/my/"
+MY_COURSES_PHP_URL = "https://moodle.tau.ac.il/my/courses.php"
+
+MOODLE_AFTER_LOGIN_CANDIDATES = [
+    MY_COURSES_URL,
+    MY_URL,
+    MY_COURSES_PHP_URL,
+    MOODLE_LOGIN_URL,
+    MOODLE_SAML_URL,
+]
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
 WAIT_SEC = 35
-POST_LOGIN_WAIT_SEC = 90
+SHORT_WAIT = 8
 HEADLESS = True
-
 STATE_FILE = "last_run.json"
 
 
@@ -83,7 +95,7 @@ class FoundFile:
 
 
 # ==========================
-# GENERAL HELPERS
+# GENERIC HELPERS
 # ==========================
 
 def _course_display_name(raw: str) -> str:
@@ -119,7 +131,8 @@ def _session_from_selenium_cookies(driver: webdriver.Chrome) -> requests.Session
     s = requests.Session()
     try:
         ua = driver.execute_script("return navigator.userAgent;")
-        s.headers.update({"User-Agent": ua})
+        if ua:
+            s.headers.update({"User-Agent": ua})
     except Exception:
         pass
 
@@ -239,11 +252,7 @@ def _format_line(item: FoundFile) -> str:
     )
 
 
-# ==========================
-# DEBUG
-# ==========================
-
-def _debug_dump_page(driver: webdriver.Chrome, prefix: str = "debug") -> None:
+def _debug_dump_page(driver: webdriver.Chrome, prefix: str) -> None:
     try:
         current_url = driver.current_url
     except Exception:
@@ -329,11 +338,13 @@ def telegram_send(text: str) -> None:
 def telegram_send_many(lines: list[str], header: str) -> None:
     max_len = 3800
     chunk = header + "\n"
+
     for line in lines:
         if len(chunk) + len(line) + 1 > max_len:
             telegram_send(chunk)
             chunk = header + "\n"
         chunk += line + "\n"
+
     if chunk.strip():
         telegram_send(chunk)
 
@@ -347,7 +358,108 @@ def github_run_url() -> str:
 
 
 # ==========================
-# SELENIUM LOGIN FLOW
+# PAGE DETECTION
+# ==========================
+
+def _page_source(driver: webdriver.Chrome) -> str:
+    try:
+        return driver.page_source or ""
+    except Exception:
+        return ""
+
+
+def _page_title(driver: webdriver.Chrome) -> str:
+    try:
+        return driver.title or ""
+    except Exception:
+        return ""
+
+
+def is_tau_block_page(driver: webdriver.Chrome) -> bool:
+    title = _page_title(driver).lower()
+    html = _page_source(driver).lower()
+
+    markers = [
+        "tau under maintenence",
+        "tau under maintenance",
+        "access denied",
+        "בקשה נדחתה",
+        "אנא נסו שוב",
+        "please try again, or contact us for support",
+    ]
+    return any(m in title or m in html for m in markers)
+
+
+def is_nidp_login_page(driver: webdriver.Chrome) -> bool:
+    url = (driver.current_url or "").lower()
+    html = _page_source(driver)
+
+    if "nidp.tau.ac.il" not in url:
+        return False
+
+    id_markers = [
+        "Ecom_User_ID",
+        "Ecom_UserID",
+        "Ecom_Taz",
+        "Ecom_Password",
+    ]
+    return any(marker in html for marker in id_markers)
+
+
+def is_logged_in_moodle_page(driver: webdriver.Chrome) -> bool:
+    url = (driver.current_url or "").lower()
+    html = _page_source(driver)
+
+    if "moodle.tau.ac.il" not in url:
+        return False
+
+    markers = [
+        "את/ה מחובר/ת כ:",
+        "login/logout.php?sesskey=",
+        "M.cfg",
+        '"userId":',
+        '"/lib/ajax/service.php?sesskey=',
+    ]
+    return any(m in html for m in markers)
+
+
+def has_course_links(driver: webdriver.Chrome) -> bool:
+    selectors = [
+        "a.mycourses_coursename",
+        "a[href*='/course/view.php?id=']",
+    ]
+    for sel in selectors:
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, sel):
+                return True
+        except Exception:
+            pass
+
+    html = _page_source(driver)
+    return "course/view.php?id=" in html
+
+
+def has_login_link_on_moodle(driver: webdriver.Chrome) -> bool:
+    if "moodle.tau.ac.il" not in (driver.current_url or "").lower():
+        return False
+
+    selectors = [
+        "#usernavigation a[href*='/login/index.php']",
+        "a[href='https://moodle.tau.ac.il/login/index.php']",
+        "a[href*='moodle.tau.ac.il/login/index.php']",
+        "a[href*='/auth/saml2/login.php']",
+    ]
+    for sel in selectors:
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, sel):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# ==========================
+# DRIVER
 # ==========================
 
 def build_driver() -> webdriver.Chrome:
@@ -356,11 +468,15 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1600,2200")
+    options.add_argument("--window-size=1600,2400")
     if HEADLESS:
         options.add_argument("--headless=new")
     return webdriver.Chrome(options=options)
 
+
+# ==========================
+# NIDP LOGIN
+# ==========================
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
     for v in values:
@@ -373,177 +489,32 @@ def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
     return None
 
 
-def _page_text(driver: webdriver.Chrome) -> str:
+def _safe_fill(driver: webdriver.Chrome, el, value: str) -> None:
     try:
-        return driver.find_element(By.TAG_NAME, "body").text
-    except Exception:
-        return ""
-
-
-def _has_moodle_auth_cookies(driver: webdriver.Chrome) -> bool:
-    names = {c.get("name", "") for c in driver.get_cookies()}
-    needed_any = {
-        "MDL_SSP_AuthToken",
-        "MDL_SSP_SessID",
-        "MOODLEID1_Moodle2025",
-    }
-    return any(name in names for name in needed_any)
-
-
-def _moodle_logged_in_markers_present(driver: webdriver.Chrome) -> bool:
-    html = ""
-    txt = ""
-    try:
-        html = driver.page_source
-    except Exception:
-        pass
-    try:
-        txt = _page_text(driver)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
     except Exception:
         pass
 
-    markers = [
-        "התנתק/י",
-        "עדן חכים",  # harmless if present; not required
-        "user/profile.php?id=",
-        "/login/logout.php?sesskey=",
-    ]
-
-    if any(m in html for m in markers):
-        return True
-    if "התנתק/י" in txt:
-        return True
-
     try:
-        if driver.find_elements(By.CSS_SELECTOR, "a[href*='/login/logout.php?sesskey=']"):
-            return True
+        el.click()
     except Exception:
-        pass
-
-    return False
-
-
-def _guest_markers_present(driver: webdriver.Chrome) -> bool:
-    txt = _page_text(driver)
-    html = ""
-    try:
-        html = driver.page_source
-    except Exception:
-        pass
-
-    guest_markers = [
-        "גישת אורחים",
-        "אתם משתמשים כרגע בגישת אורחים",
-        "Guest access",
-        "You are logged in as a guest",
-    ]
-    return any(g in txt or g in html for g in guest_markers)
-
-
-def _blocked_page_present(driver: webdriver.Chrome) -> bool:
-    txt = _page_text(driver)
-    title = ""
-    html = ""
-    try:
-        title = driver.title or ""
-    except Exception:
-        pass
-    try:
-        html = driver.page_source
-    except Exception:
-        pass
-
-    markers = [
-        "TAU Under Maintenence",
-        "Access denied.",
-        "בקשה נדחתה.",
-        "אנא נסו שוב, או צרו קשר עם מרכז התמיכה.",
-    ]
-    blob = "\n".join([title, txt, html[:5000]])
-    return any(m in blob for m in markers)
-
-
-def _click_first_visible(driver: webdriver.Chrome, selectors: list[tuple[str, str]]) -> bool:
-    for by_name, value in selectors:
         try:
-            by = getattr(By, by_name)
-            elems = driver.find_elements(by, value)
-            for el in elems:
-                if el.is_displayed() and el.is_enabled():
-                    try:
-                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                    except Exception:
-                        pass
-                    try:
-                        el.click()
-                    except Exception:
-                        driver.execute_script("arguments[0].click();", el)
-                    return True
+            driver.execute_script("arguments[0].click();", el)
         except Exception:
-            continue
-    return False
+            pass
 
-
-def open_moodle_and_start_login(driver: webdriver.Chrome) -> None:
-    wait = WebDriverWait(driver, WAIT_SEC)
-    driver.get(MY_COURSES_URL)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(1.2)
-
-    if _blocked_page_present(driver):
-        _debug_dump_page(driver, "debug_blocked_before_login")
-        raise RuntimeError("TAU/Moodle returned a blocked page before login started.")
-
-    if _moodle_logged_in_markers_present(driver):
-        return
-
-    if _guest_markers_present(driver):
-        clicked = _click_first_visible(driver, [
-            ("CSS_SELECTOR", "div[data-region='usermenu'] a[href='https://moodle.tau.ac.il/login/index.php']"),
-            ("CSS_SELECTOR", "div[data-region='usermenu'] a[href*='/login/index.php']"),
-            ("CSS_SELECTOR", "span.login a[href*='/login/index.php']"),
-            ("XPATH", "//a[contains(normalize-space(.), 'התחבר/י')]"),
-            ("XPATH", "//a[contains(normalize-space(.), 'התחבר')]"),
-            ("XPATH", "//a[contains(normalize-space(.), 'Login')]"),
-            ("XPATH", "//a[contains(normalize-space(.), 'Sign in')]"),
-        ])
-        if not clicked:
-            _debug_dump_page(driver, "debug_guest_no_login_link")
-            raise RuntimeError("Guest page detected but login link was not found.")
-        time.sleep(1.5)
-        return
-
-    # fallback: if we are on Moodle but not clearly guest/logged-in, try login page
-    driver.get(MOODLE_LOGIN_URL)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(1.2)
-
-
-def maybe_click_saml_from_moodle_login(driver: webdriver.Chrome) -> None:
-    """
-    Some Moodle login pages redirect automatically to NIDP.
-    If not, click the SAML/University login entry if present.
-    """
-    if "nidp.tau.ac.il" in driver.current_url.lower():
-        return
-
-    txt = _page_text(driver)
-    html = ""
     try:
-        html = driver.page_source
+        el.send_keys(Keys.CONTROL, "a")
+        el.send_keys(Keys.BACKSPACE)
+        el.send_keys(value)
     except Exception:
-        pass
-
-    if "nidp.tau.ac.il" in html:
-        clicked = _click_first_visible(driver, [
-            ("CSS_SELECTOR", "a[href*='/auth/saml2/login.php']"),
-            ("CSS_SELECTOR", "a[href*='nidp.tau.ac.il']"),
-            ("XPATH", "//a[contains(@href,'/auth/saml2/login.php')]"),
-            ("XPATH", "//a[contains(., 'הזדהות אוניברסיטאית')]"),
-            ("XPATH", "//a[contains(., 'אוניברסיטאית')]"),
-        ])
-        if clicked:
-            time.sleep(1.5)
+        driver.execute_script(
+            "arguments[0].value = arguments[1];"
+            "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+            "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+            el,
+            value,
+        )
 
 
 def maybe_login_nidp(driver: webdriver.Chrome) -> None:
@@ -553,218 +524,268 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
     pid_ids = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
     pass_ids = ["Ecom_Password", "Ecom_Pass", "password", "pass"]
 
-    def any_visible_login_field_present(d):
-        return (_find_any(d, By.ID, user_ids) is not None) or (_find_any(d, By.ID, pass_ids) is not None)
-
     try:
-        wait.until(any_visible_login_field_present)
+        wait.until(lambda d: is_nidp_login_page(d))
     except Exception:
         return
 
-    def _safe_fill(el, value: str):
-        try:
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        except Exception:
-            pass
-
-        try:
-            el.click()
-        except Exception:
-            try:
-                driver.execute_script("arguments[0].click();", el)
-            except Exception:
-                pass
-
-        try:
-            el.send_keys(Keys.CONTROL, "a")
-            el.send_keys(Keys.BACKSPACE)
-            el.send_keys(value)
-            return
-        except Exception:
-            driver.execute_script(
-                "arguments[0].value = arguments[1];"
-                "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
-                "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
-                el, value
-            )
-
     user_field = _find_any(driver, By.ID, user_ids)
-    if user_field:
-        _safe_fill(user_field, USERNAME)
-
     pid_field = _find_any(driver, By.ID, pid_ids)
-    if pid_field:
-        _safe_fill(pid_field, USER_ID)
-
     pass_field = _find_any(driver, By.ID, pass_ids)
-    if not pass_field:
+
+    if user_field:
+        _safe_fill(driver, user_field, USERNAME)
+    if pid_field:
+        _safe_fill(driver, pid_field, USER_ID)
+    if pass_field:
+        _safe_fill(driver, pass_field, PASSWORD)
+    else:
         return
 
-    _safe_fill(pass_field, PASSWORD)
+    submit_selectors = [
+        "button[type='submit']",
+        "input[type='submit']",
+        "button.btn-primary",
+        "button.login-btn",
+    ]
+    for sel in submit_selectors:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    try:
+                        driver.execute_script("arguments[0].click();", el)
+                        break
+                    except Exception:
+                        pass
+            else:
+                continue
+            break
+        except Exception:
+            pass
+    else:
+        pass_field.send_keys(Keys.RETURN)
 
-    clicked = False
+    # wait until we are no longer on the raw login form
     try:
-        login_btn = driver.find_element(By.ID, "loginButton")
-        if login_btn.is_displayed() and login_btn.is_enabled():
-            login_btn.click()
-            clicked = True
+        WebDriverWait(driver, WAIT_SEC).until(lambda d: not is_nidp_login_page(d))
     except Exception:
         pass
 
-    if not clicked:
-        pass_field.send_keys(Keys.RETURN)
 
+# ==========================
+# MOODLE SESSION ESTABLISHMENT
+# ==========================
 
-def wait_until_really_logged_in(driver: webdriver.Chrome) -> None:
-    """
-    Critical part:
-    after NIDP submit, do not immediately declare success.
-    We wait until Moodle auth cookies OR logged-in markers appear.
-    """
-    deadline = time.time() + POST_LOGIN_WAIT_SEC
-    last_url = ""
-
-    while time.time() < deadline:
+def click_visible(driver: webdriver.Chrome, selectors: list[str]) -> bool:
+    for sel in selectors:
         try:
-            cur = driver.current_url
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in els:
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script("arguments[0].click();", el)
+                    return True
         except Exception:
-            cur = ""
-        if cur != last_url:
-            print(f"DEBUG login_wait url={cur}")
-            last_url = cur
+            pass
+    return False
 
-        if _blocked_page_present(driver):
-            _debug_dump_page(driver, "debug_blocked_after_login")
-            raise RuntimeError("Blocked page appeared after login.")
 
-        if _has_moodle_auth_cookies(driver):
-            # one more gentle nudge to land on mycourses
-            try:
-                driver.get(MY_COURSES_URL)
-                WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-                time.sleep(2)
-            except Exception:
-                pass
+def click_text_link(driver: webdriver.Chrome, texts: list[str]) -> bool:
+    for txt in texts:
+        try:
+            els = driver.find_elements(By.XPATH, f"//a[contains(normalize-space(.), '{txt}')]")
+            for el in els:
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    return True
+        except Exception:
+            pass
+    return False
 
-            if _moodle_logged_in_markers_present(driver) or not _guest_markers_present(driver):
-                return
 
-        if _moodle_logged_in_markers_present(driver):
-            return
+def click_moodle_link_from_nidp_portal(driver: webdriver.Chrome) -> bool:
+    candidates_css = [
+        "a[href*='moodle.tau.ac.il']",
+        "a[href*='Virtual']",
+        "a[href*='virtual']",
+    ]
+    if click_visible(driver, candidates_css):
+        return True
 
-        # If still on NIDP portal, let it breathe; every few seconds nudge back to Moodle.
-        if "nidp.tau.ac.il/nidp/portal" in cur.lower():
+    texts = ["Moodle", "מודל", "Virtual TAU", "למידה אקדמית ברשת"]
+    return click_text_link(driver, texts)
+
+
+def start_login_from_moodle_login_link(driver: webdriver.Chrome) -> bool:
+    selectors = [
+        "#usernavigation a[href*='/login/index.php']",
+        "a[href='https://moodle.tau.ac.il/login/index.php']",
+        "a[href*='moodle.tau.ac.il/login/index.php']",
+        "a[href*='/auth/saml2/login.php']",
+    ]
+    if click_visible(driver, selectors):
+        return True
+
+    texts = ["התחבר/י", "התחבר", "כניסה", "Login", "Sign in"]
+    return click_text_link(driver, texts)
+
+
+def wait_body(driver: webdriver.Chrome, timeout: int = WAIT_SEC) -> None:
+    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+
+def establish_moodle_session_after_nidp(driver: webdriver.Chrome) -> None:
+    wait_body(driver)
+
+    # If we land in NIDP portal after auth, first try portal -> Moodle
+    if "nidp.tau.ac.il/nidp/portal" in (driver.current_url or "").lower():
+        if click_moodle_link_from_nidp_portal(driver):
             time.sleep(2.5)
             try:
-                driver.get(MY_COURSES_URL)
+                wait_body(driver)
             except Exception:
                 pass
-            time.sleep(2)
+
+    # Try several Moodle entry points AFTER auth
+    for target in MOODLE_AFTER_LOGIN_CANDIDATES:
+        try:
+            driver.get(target)
+            wait_body(driver, SHORT_WAIT)
+            time.sleep(1.5)
+
+            if is_nidp_login_page(driver):
+                maybe_login_nidp(driver)
+                time.sleep(2.0)
+                try:
+                    wait_body(driver, SHORT_WAIT)
+                except Exception:
+                    pass
+
+            if is_logged_in_moodle_page(driver) or has_course_links(driver):
+                return
+
+            # Sometimes Moodle shows guest page with a login link
+            if has_login_link_on_moodle(driver):
+                if start_login_from_moodle_login_link(driver):
+                    time.sleep(2.0)
+                    if is_nidp_login_page(driver):
+                        maybe_login_nidp(driver)
+                        time.sleep(2.5)
+                        try:
+                            wait_body(driver, SHORT_WAIT)
+                        except Exception:
+                            pass
+
+                    if is_logged_in_moodle_page(driver) or has_course_links(driver):
+                        return
+
+        except Exception:
             continue
 
-        # If still on NIDP domain, just wait a bit.
-        if "nidp.tau.ac.il" in cur.lower():
-            time.sleep(2)
-            continue
-
-        # If on Moodle but still guest, try going once to login page and back.
-        if "moodle.tau.ac.il" in cur.lower() and _guest_markers_present(driver):
-            try:
-                driver.get(MOODLE_LOGIN_URL)
-                time.sleep(2)
-                maybe_click_saml_from_moodle_login(driver)
-                time.sleep(2)
-                if "nidp.tau.ac.il" in driver.current_url.lower():
-                    # already authenticated at IdP; bounce back to SP
-                    driver.get(MY_COURSES_URL)
-            except Exception:
-                pass
-            time.sleep(2)
-            continue
-
-        # Generic short wait
-        time.sleep(1.5)
-
-    _debug_dump_page(driver, "debug_not_logged_in_final")
-    raise RuntimeError("SSO login finished at NIDP/Moodle but Moodle session was not established.")
+    _debug_dump_page(driver, "debug_after_nidp_no_moodle_session")
+    raise RuntimeError(
+        "NIDP login finished, but Moodle session was not established afterwards."
+    )
 
 
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
-    open_moodle_and_start_login(driver)
-    maybe_click_saml_from_moodle_login(driver)
+    driver.get(LOGIN_URL)
+    wait_body(driver)
+    time.sleep(1.0)
 
-    # If we reached NIDP login page -> fill it
-    maybe_login_nidp(driver)
+    if is_nidp_login_page(driver):
+        maybe_login_nidp(driver)
+        time.sleep(2.5)
 
-    # Now wait until Moodle auth is real
-    wait_until_really_logged_in(driver)
+    establish_moodle_session_after_nidp(driver)
 
-    # Final landing
-    driver.get(MY_COURSES_URL)
-    WebDriverWait(driver, WAIT_SEC).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(2)
+    # Final pass: force My Courses only after session exists
+    for target in [MY_COURSES_URL, MY_URL, MY_COURSES_PHP_URL]:
+        try:
+            driver.get(target)
+            wait_body(driver, SHORT_WAIT)
+            time.sleep(1.2)
 
-    if _guest_markers_present(driver):
-        _debug_dump_page(driver, "debug_guest_after_final_mycourses")
-        raise RuntimeError("Returned to MyCourses but still guest.")
+            if is_logged_in_moodle_page(driver) and (has_course_links(driver) or "moodle.tau.ac.il" in (driver.current_url or "").lower()):
+                return
+        except Exception:
+            continue
 
-    if _blocked_page_present(driver):
-        _debug_dump_page(driver, "debug_blocked_after_final_mycourses")
-        raise RuntimeError("Returned to MyCourses but got blocked page.")
+    _debug_dump_page(driver, "debug_logged_in_but_no_mycourses")
+    raise RuntimeError("Moodle session exists, but could not open a usable courses page.")
+
+
+# ==========================
+# COURSE EXTRACTION
+# ==========================
+
+def extract_courses_from_page(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    links_elems = []
+
+    selectors = [
+        "a.mycourses_coursename",
+        "a[href*='/course/view.php?id=']",
+    ]
+    for sel in selectors:
+        try:
+            links_elems.extend(driver.find_elements(By.CSS_SELECTOR, sel))
+        except Exception:
+            pass
+
+    courses: list[tuple[str, str]] = []
+    seen = set()
+
+    for a in links_elems:
+        try:
+            href = a.get_attribute("href") or ""
+            name = (a.text or "").strip()
+            if "course/view.php?id=" not in href:
+                continue
+            if not name:
+                name = href
+            if href not in seen:
+                seen.add(href)
+                courses.append((name, href))
+        except Exception:
+            continue
+
+    # Fallback from raw HTML
+    if not courses:
+        html = _page_source(driver)
+        matches = re.findall(r'href="(https://moodle\.tau\.ac\.il/course/view\.php\?id=\d+)"', html)
+        seen = set()
+        for href in matches:
+            if href not in seen:
+                seen.add(href)
+                courses.append((href, href))
+
+    return courses
 
 
 def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     ensure_logged_in_moodle(driver)
 
-    wait = WebDriverWait(driver, WAIT_SEC)
-
-    def course_links_present(d):
+    candidate_pages = [MY_COURSES_URL, MY_URL, MY_COURSES_PHP_URL]
+    for target in candidate_pages:
         try:
-            elems = d.find_elements(By.CSS_SELECTOR, "a[href*='/course/view.php?id=']")
-            visible = [e for e in elems if e.is_displayed()]
-            return len(visible) > 0
-        except Exception:
-            return False
+            driver.get(target)
+            wait_body(driver, SHORT_WAIT)
+            time.sleep(1.5)
 
-    try:
-        wait.until(course_links_present)
-    except Exception:
-        _debug_dump_page(driver, "debug_no_course_links_after_login")
-        raise
+            if not is_logged_in_moodle_page(driver):
+                continue
 
-    links_elems = driver.find_elements(By.CSS_SELECTOR, "a[href*='/course/view.php?id=']")
-
-    courses: list[tuple[str, str]] = []
-    for a in links_elems:
-        try:
-            href = a.get_attribute("href")
-            name = (a.text or "").strip()
-            if href and "course/view.php?id=" in href:
-                if not name:
-                    try:
-                        name = a.get_attribute("title") or href
-                    except Exception:
-                        name = href
-                courses.append((name, href))
+            courses = extract_courses_from_page(driver)
+            if courses:
+                print(f"DEBUG collected {len(courses)} course links from {target}")
+                for idx, (n, u) in enumerate(courses[:20], start=1):
+                    print(f"DEBUG course {idx}: {n} -> {u}")
+                return courses
         except Exception:
             continue
 
-    uniq: list[tuple[str, str]] = []
-    seen = set()
-    for n, u in courses:
-        if u not in seen:
-            uniq.append((n, u))
-            seen.add(u)
-
-    if not uniq:
-        _debug_dump_page(driver, "debug_empty_courses_list")
-        raise RuntimeError("No course links were found after successful login.")
-
-    print(f"DEBUG collected {len(uniq)} course links")
-    for idx, (n, u) in enumerate(uniq[:20], start=1):
-        print(f"DEBUG course {idx}: {n} -> {u}")
-
-    return uniq
+    _debug_dump_page(driver, "debug_no_courses_found")
+    raise RuntimeError("No course links were found on any Moodle course landing page.")
 
 
 # ==========================
