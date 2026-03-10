@@ -2,19 +2,12 @@
 """
 TAU Moodle scanner (GitHub Actions-ready):
 - Login to TAU NIDP (SSO) via Selenium headless Chrome
-- Go to My Courses
+- Go to My Courses (https://moodle.tau.ac.il/local/mycourses/)
 - Scan course pages for pluginfile links + resolve resource/folder/assign
 - Use HTTP Last-Modified as "שינוי אחרון"
 - Check only what changed since last run (stored in last_run.json)
 - If there are updates -> send Telegram message (no updates -> send nothing)
 - If there is an error -> send Telegram message with the GitHub Actions run link + traceback
-
-NEW:
-- Preflight HTTP checks before Selenium:
-  * https://moodle.tau.ac.il/
-  * https://moodle.tau.ac.il/local/mycourses/
-  * LOGIN_URL
-- Detects TAU WAF / maintenance / access denied page early.
 """
 
 from dataclasses import dataclass
@@ -276,67 +269,6 @@ def _debug_dump_page(driver: webdriver.Chrome, prefix: str = "debug") -> None:
         print(f"DEBUG failed saving screenshot: {e}")
 
 
-def _http_probe(url: str) -> tuple[int | None, str, str]:
-    """
-    Returns: (status_code_or_none, final_url, first_2000_chars)
-    """
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-        }
-        r = requests.get(url, headers=headers, allow_redirects=True, timeout=40)
-        text = r.text if isinstance(r.text, str) else ""
-        return r.status_code, r.url, text[:2000]
-    except Exception as e:
-        return None, url, f"EXCEPTION: {e}"
-
-
-def _looks_like_tau_block_page(text: str) -> bool:
-    t = text or ""
-    markers = [
-        "TAU Under Maintenence",
-        "Under Maintenence",
-        "Access denied",
-        "בקשה נדחתה",
-        "Please try again, or contact us for support",
-        "אנא נסו שוב, או צרו קשר עם מרכז התמיכה",
-        "Your support ID is:",
-    ]
-    return any(m in t for m in markers)
-
-
-def preflight_network_access_check() -> None:
-    """
-    Early check: can this GitHub runner reach TAU endpoints at all?
-    If blocked by TAU/WAF/maintenance page, fail immediately with a clear message.
-    """
-    targets = [
-        ("moodle_root", MOODLE_ROOT_URL),
-        ("my_courses", MY_COURSES_URL),
-        ("nidp_login", LOGIN_URL),
-    ]
-
-    lines = ["=== PREFLIGHT CHECK ==="]
-    blocked = False
-
-    for name, url in targets:
-        status, final_url, snippet = _http_probe(url)
-        lines.append(f"[{name}] url={url}")
-        lines.append(f"[{name}] status={status}")
-        lines.append(f"[{name}] final_url={final_url}")
-        lines.append(f"[{name}] snippet={snippet[:500]}")
-        lines.append("-" * 60)
-
-        if _looks_like_tau_block_page(snippet):
-            blocked = True
-
-    print("\n".join(lines))
-
-    if blocked:
-        raise RuntimeError(
-            "Preflight failed: TAU returned an Access denied / maintenance-style page to this runner. "
-            "The issue is network/server-side access from GitHub Actions, before Selenium login begins."
-        )
 
 
 # ==========================
@@ -771,9 +703,6 @@ def main():
 
     run_start = datetime.now(TZ_IL)
     last_run = load_last_run()
-
-    # NEW: before Selenium, verify this runner can even reach TAU endpoints
-    preflight_network_access_check()
 
     driver = build_driver()
     try:
