@@ -8,6 +8,13 @@ TAU Moodle scanner (GitHub Actions-ready):
 - Check only what changed since last run (stored in last_run.json)
 - If there are updates -> send Telegram message (no updates -> send nothing)
 - If there is an error -> send Telegram message with the GitHub Actions run link + traceback
+
+NEW:
+- Preflight HTTP checks before Selenium:
+  * https://moodle.tau.ac.il/
+  * https://moodle.tau.ac.il/local/mycourses/
+  * LOGIN_URL
+- Detects TAU WAF / maintenance / access denied page early.
 """
 
 from dataclasses import dataclass
@@ -45,6 +52,7 @@ except ImportError:
 
 LOGIN_URL = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential&sid=0"
 MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
+MOODLE_ROOT_URL = "https://moodle.tau.ac.il/"
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
 WAIT_SEC = 30
@@ -268,6 +276,69 @@ def _debug_dump_page(driver: webdriver.Chrome, prefix: str = "debug") -> None:
         print(f"DEBUG failed saving screenshot: {e}")
 
 
+def _http_probe(url: str) -> tuple[int | None, str, str]:
+    """
+    Returns: (status_code_or_none, final_url, first_2000_chars)
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+        }
+        r = requests.get(url, headers=headers, allow_redirects=True, timeout=40)
+        text = r.text if isinstance(r.text, str) else ""
+        return r.status_code, r.url, text[:2000]
+    except Exception as e:
+        return None, url, f"EXCEPTION: {e}"
+
+
+def _looks_like_tau_block_page(text: str) -> bool:
+    t = text or ""
+    markers = [
+        "TAU Under Maintenence",
+        "Under Maintenence",
+        "Access denied",
+        "בקשה נדחתה",
+        "Please try again, or contact us for support",
+        "אנא נסו שוב, או צרו קשר עם מרכז התמיכה",
+        "Your support ID is:",
+    ]
+    return any(m in t for m in markers)
+
+
+def preflight_network_access_check() -> None:
+    """
+    Early check: can this GitHub runner reach TAU endpoints at all?
+    If blocked by TAU/WAF/maintenance page, fail immediately with a clear message.
+    """
+    targets = [
+        ("moodle_root", MOODLE_ROOT_URL),
+        ("my_courses", MY_COURSES_URL),
+        ("nidp_login", LOGIN_URL),
+    ]
+
+    lines = ["=== PREFLIGHT CHECK ==="]
+    blocked = False
+
+    for name, url in targets:
+        status, final_url, snippet = _http_probe(url)
+        lines.append(f"[{name}] url={url}")
+        lines.append(f"[{name}] status={status}")
+        lines.append(f"[{name}] final_url={final_url}")
+        lines.append(f"[{name}] snippet={snippet[:500]}")
+        lines.append("-" * 60)
+
+        if _looks_like_tau_block_page(snippet):
+            blocked = True
+
+    print("\n".join(lines))
+
+    if blocked:
+        raise RuntimeError(
+            "Preflight failed: TAU returned an Access denied / maintenance-style page to this runner. "
+            "The issue is network/server-side access from GitHub Actions, before Selenium login begins."
+        )
+
+
 # ==========================
 # STATE (last run)
 # ==========================
@@ -472,11 +543,6 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
 
 
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
-    """
-    Go to MyCourses.
-    If guest access -> click login -> complete SSO -> back to MyCourses.
-    Adds debug dump before failing.
-    """
     wait = WebDriverWait(driver, WAIT_SEC)
     driver.get(MY_COURSES_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -497,22 +563,17 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         cur_url = d.current_url.lower()
         page_html = d.page_source
 
-        # Old layout
         if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
             return True
 
-        # New layout - any course/view link
         if "local/mycourses" in cur_url:
             links = d.find_elements(By.CSS_SELECTOR, "a[href*='/course/view.php?id=']")
             if links:
                 return True
 
-        # Sometimes course cards are rendered with other links/classes
-        if "local/mycourses" in cur_url:
-            if "course/view.php?id=" in page_html:
-                return True
+        if "local/mycourses" in cur_url and "course/view.php?id=" in page_html:
+            return True
 
-        # Guest indicators
         guest_markers = [
             "גישת אורחים",
             "Guest access",
@@ -522,7 +583,6 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         if any(g in page_html for g in guest_markers):
             return True
 
-        # Login indicators - useful to stop waiting if we got stuck back on login
         login_markers = [
             "Ecom_User_ID",
             "Ecom_Password",
@@ -541,7 +601,6 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         _debug_dump_page(driver, "debug_before_wait")
         raise
 
-    # If we landed back on login page, fail with useful debug
     page_html = driver.page_source
     login_markers = [
         "Ecom_User_ID",
@@ -712,6 +771,9 @@ def main():
 
     run_start = datetime.now(TZ_IL)
     last_run = load_last_run()
+
+    # NEW: before Selenium, verify this runner can even reach TAU endpoints
+    preflight_network_access_check()
 
     driver = build_driver()
     try:
