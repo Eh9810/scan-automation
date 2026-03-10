@@ -1,26 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-TAU Moodle scanner (GitHub Actions-ready):
-- Login to TAU NIDP (SSO) via Selenium headless Chrome
-- Go to My Courses
-- Scan course pages for pluginfile links + resolve resource/folder/assign
-- Use HTTP Last-Modified as "שינוי אחרון"
-- Check only what changed since last run (stored in last_run.json)
-- If there are updates -> send Telegram message (no updates -> send nothing)
-- If there is an error -> send Telegram message with the GitHub Actions run link + traceback
+TAU Moodle scanner (GitHub Actions-ready).
+
+What this version changes:
+- Uses Selenium only for TAU NIDP login / SSO.
+- Avoids depending only on /local/mycourses/ HTML.
+- Tries multiple Moodle landing pages after login.
+- Extracts sesskey from a Moodle page and tries Moodle AJAX course APIs.
+- Falls back to parsing rendered HTML course links.
+- Falls back to cached course URLs if course list retrieval is temporarily blocked.
+- Scans course pages for pluginfile/resource/folder/assign links.
+- Uses HTTP Last-Modified as "שינוי אחרון".
+- Sends Telegram only on updates or on failure.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urljoin
 import json
 import os
 import re
 import time
 import traceback
+from typing import Any
 
 import requests
+from bs4 import BeautifulSoup
+from zoneinfo import ZoneInfo
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -28,40 +38,46 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    raise SystemExit("Missing bs4. Install: pip install beautifulsoup4")
-
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    raise SystemExit("Missing zoneinfo (Python 3.9+).")
-
 
 # ==========================
 # CONFIG
 # ==========================
 
-LOGIN_URL      = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential&sid=0"
+LOGIN_URL = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential&sid=0"
+MOODLE_ROOT_URL = "https://moodle.tau.ac.il/"
+MY_OVERVIEW_URL = "https://moodle.tau.ac.il/my/"
+MY_COURSES_CLASSIC_URL = "https://moodle.tau.ac.il/my/courses.php"
 MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
-MOODLE_BASE    = "https://moodle.tau.ac.il"
 
-TZ_IL    = ZoneInfo("Asia/Jerusalem")
-WAIT_SEC = 45          # increased from 30
+MOODLE_PAGE_CANDIDATES = [
+    MY_COURSES_CLASSIC_URL,
+    MY_OVERVIEW_URL,
+    MOODLE_ROOT_URL,
+    MY_COURSES_URL,
+]
+
+TZ_IL = ZoneInfo("Asia/Jerusalem")
+WAIT_SEC = 35
 HEADLESS = True
 
 STATE_FILE = "last_run.json"
+COURSE_CACHE_FILE = "course_cache.json"
+
+REQUEST_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+)
 
 # ==========================
-# SECRETS (from GitHub Actions env vars)
+# SECRETS
 # ==========================
+
 USERNAME = os.environ.get("MOODLE_USERNAME", "")
-USER_ID  = os.environ.get("MOODLE_USER_ID", "")
+USER_ID = os.environ.get("MOODLE_USER_ID", "")
 PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 # ==========================
@@ -78,15 +94,14 @@ class FoundFile:
 
 
 # ==========================
-# HELPERS
+# BASIC HELPERS
 # ==========================
 
 def _course_display_name(raw: str) -> str:
     s = (raw or "").strip()
     if " - " in s:
         left, right = s.split(" - ", 1)
-        # Strip leading zeros before checking if it's a course code
-        if re.fullmatch(r"0*\d{6,}", left.strip()):
+        if re.fullmatch(r"\d{6,}", left.strip()):
             s = right.strip()
     return s
 
@@ -98,7 +113,7 @@ def _safe_filename_from_url(url: str) -> str:
     return name or url
 
 
-def _parse_http_last_modified(headers) -> datetime | None:
+def _parse_http_last_modified(headers: dict[str, str]) -> datetime | None:
     lm = headers.get("Last-Modified") or headers.get("last-modified")
     if not lm:
         return None
@@ -111,132 +126,134 @@ def _parse_http_last_modified(headers) -> datetime | None:
         return None
 
 
-def _session_from_selenium_cookies(driver: webdriver.Chrome) -> requests.Session:
-    s = requests.Session()
-    try:
-        ua = driver.execute_script("return navigator.userAgent;")
-        s.headers.update({"User-Agent": ua})
-    except Exception:
-        pass
-    for c in driver.get_cookies():
-        s.cookies.set(
-            name=c.get("name"),
-            value=c.get("value"),
-            domain=c.get("domain"),
-            path=c.get("path", "/"),
-        )
-    return s
+def _normalize_url(url: str, base: str = MOODLE_ROOT_URL) -> str:
+    return urljoin(base, url)
 
 
-def _http_head_follow(session: requests.Session, url: str) -> requests.Response | None:
-    try:
-        r = session.head(url, allow_redirects=True, timeout=30)
-        if r.status_code in (403, 405) or (r.status_code >= 400 and "Last-Modified" not in r.headers):
-            r = session.get(url, allow_redirects=True, timeout=30, stream=True)
-        return r
-    except Exception:
-        return None
+def _clean_html_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def _http_get_html(session: requests.Session, url: str) -> str | None:
-    try:
-        r = session.get(url, allow_redirects=True, timeout=40)
-        if r.status_code >= 400:
-            return None
-        return r.text
-    except Exception:
-        return None
+def _looks_like_tau_block_page(html: str, title: str = "") -> bool:
+    text = f"{title}\n{html}".lower()
+    bad_markers = [
+        "tau under maintenence",
+        "tau under maintenance",
+        "access denied",
+        "בקשה נדחתה",
+        "please try again, or contact us for support",
+        "אנא נסו שוב, או צרו קשר עם מרכז התמיכה",
+    ]
+    return any(m.lower() in text for m in bad_markers)
 
 
-def _extract_pluginfile_links_from_html(html: str) -> list[tuple[str, str]]:
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.select("a[href*='pluginfile.php']"):
-        href = a.get("href")
-        if not href:
-            continue
-        text = (a.get_text(" ", strip=True) or "").strip()
-        out.append((href, text))
-    return out
-
-
-def _extract_activity_links_from_course_html(html: str) -> tuple[set[str], set[str]]:
-    soup = BeautifulSoup(html, "html.parser")
-    pluginfiles    = set()
-    activity_pages = set()
-
-    for a in soup.select("a[href]"):
-        href = a.get("href")
-        if not href:
-            continue
-        if "moodle.tau.ac.il/pluginfile.php/" in href:
-            pluginfiles.add(href)
-            continue
-        if "moodle.tau.ac.il/mod/resource/view.php" in href:
-            activity_pages.add(href)
-        elif "moodle.tau.ac.il/mod/folder/view.php" in href:
-            activity_pages.add(href)
-        elif "moodle.tau.ac.il/mod/assign/view.php" in href:
-            activity_pages.add(href)
-
-    return pluginfiles, activity_pages
-
-
-def _resolve_resource_view_to_file(session: requests.Session, view_url: str) -> list[str]:
-    urls: list[str] = []
-    if "redirect=" not in view_url:
-        joiner   = "&" if "?" in view_url else "?"
-        test_url = view_url + f"{joiner}redirect=1"
-    else:
-        test_url = view_url
-
-    r = _http_head_follow(session, test_url)
-    if r is not None and r.url and "pluginfile.php" in r.url:
-        urls.append(r.url)
-        return urls
-
-    html = _http_get_html(session, view_url)
+def _extract_sesskey_from_html(html: str) -> str | None:
     if not html:
-        return urls
-    for href, _txt in _extract_pluginfile_links_from_html(html):
-        urls.append(href)
-    return list(dict.fromkeys(urls))
-
-
-def _get_last_modified_for_file(session: requests.Session, file_url: str) -> datetime | None:
-    r = _http_head_follow(session, file_url)
-    if not r:
         return None
-    return _parse_http_last_modified(r.headers)
+
+    patterns = [
+        r'"sesskey":"([^"]+)"',
+        r"'sesskey':'([^']+)'",
+        r'name="sesskey"\s+value="([^"]+)"',
+        r'"sessiontimeoutwarning":"\d+".*?"sesskey":"([^"]+)"',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return None
 
 
-def _normalize_link_for_print(original_link: str, pluginfile_link: str) -> str:
-    if (
-        "mod/resource/view.php" in original_link
-        or "mod/folder/view.php" in original_link
-        or "mod/assign/view.php" in original_link
-    ):
-        return original_link
-    return pluginfile_link
+def _extract_course_links_from_html(html: str) -> list[tuple[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    courses: list[tuple[str, str]] = []
+
+    for a in soup.select("a[href*='/course/view.php?id=']"):
+        href = a.get("href")
+        if not href:
+            continue
+        href = _normalize_url(href)
+
+        name = _clean_html_text(a.get_text(" ", strip=True))
+        if not name:
+            h = a.select_one("h1, h2, h3, h4, h5, h6, span, div")
+            if h:
+                name = _clean_html_text(h.get_text(" ", strip=True))
+        if not name:
+            name = href
+
+        courses.append((name, href))
+
+    uniq: list[tuple[str, str]] = []
+    seen = set()
+    for name, href in courses:
+        if href not in seen:
+            uniq.append((name, href))
+            seen.add(href)
+    return uniq
 
 
 def _format_line(item: FoundFile) -> str:
     return (
-        f"{item.course_name_display} | "
-        f"שם הקובץ: {item.file_name} | "
-        f"שינוי אחרון: {item.last_modified_il.strftime('%d.%m.%Y %H:%M')} | "
+        f"{item.course_name_display}\t | "
+        f"שם הקובץ: {item.file_name}\t | "
+        f"שינוי אחרון: {item.last_modified_il.strftime('%d.%m.%Y %H:%M')}\t | "
         f"קישור: {item.link}"
     )
 
 
 # ==========================
-# STATE (last run)
+# DEBUG
+# ==========================
+
+def _debug_dump_html_text(html: str, prefix: str) -> None:
+    try:
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(html or "")
+        print(f"DEBUG saved HTML to {prefix}.html")
+    except Exception as e:
+        print(f"DEBUG failed saving HTML ({prefix}): {e}")
+
+
+def _debug_dump_page(driver: webdriver.Chrome, prefix: str) -> None:
+    try:
+        current_url = driver.current_url
+    except Exception:
+        current_url = "<unknown>"
+
+    try:
+        title = driver.title
+    except Exception:
+        title = "<unknown>"
+
+    try:
+        page_source = driver.page_source
+    except Exception:
+        page_source = "<cannot-read-page-source>"
+
+    print(f"DEBUG {prefix} current_url: {current_url}")
+    print(f"DEBUG {prefix} title: {title}")
+    print(f"DEBUG {prefix} page source snippet:\n{page_source[:5000]}")
+
+    _debug_dump_html_text(page_source, prefix)
+
+    try:
+        driver.save_screenshot(f"{prefix}.png")
+        print(f"DEBUG saved screenshot to {prefix}.png")
+    except Exception as e:
+        print(f"DEBUG failed saving screenshot ({prefix}): {e}")
+
+
+# ==========================
+# STATE / CACHE
 # ==========================
 
 def load_last_run() -> datetime:
     fallback = datetime.now(TZ_IL) - timedelta(hours=1)
+
     if not os.path.exists(STATE_FILE):
         return fallback
+
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -257,6 +274,27 @@ def save_last_run(run_start: datetime) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def load_course_cache() -> list[tuple[str, str]]:
+    if not os.path.exists(COURSE_CACHE_FILE):
+        return []
+    try:
+        with open(COURSE_CACHE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        out: list[tuple[str, str]] = []
+        for item in raw:
+            if isinstance(item, dict) and item.get("url"):
+                out.append((str(item.get("name") or item["url"]), str(item["url"])))
+        return out
+    except Exception:
+        return []
+
+
+def save_course_cache(courses: list[tuple[str, str]]) -> None:
+    payload = [{"name": name, "url": url} for name, url in courses]
+    with open(COURSE_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 # ==========================
 # TELEGRAM
 # ==========================
@@ -265,33 +303,33 @@ def telegram_send(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram secrets missing; skipping send.")
         return
-    url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "disable_web_page_preview": True,
     }
-    try:
-        r = requests.post(url, json=payload, timeout=30)
-        print(r.text)
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
+    r = requests.post(url, json=payload, timeout=30)
+    print(r.text)
 
 
 def telegram_send_many(lines: list[str], header: str) -> None:
     max_len = 3800
-    chunk   = header + "\n"
+    chunk = header + "\n"
+
     for line in lines:
         if len(chunk) + len(line) + 1 > max_len:
             telegram_send(chunk)
             chunk = header + "\n"
         chunk += line + "\n"
+
     if chunk.strip():
         telegram_send(chunk)
 
 
 def github_run_url() -> str:
-    repo   = os.environ.get("GITHUB_REPOSITORY", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     if repo and run_id:
         return f"https://github.com/{repo}/actions/runs/{run_id}"
@@ -299,26 +337,106 @@ def github_run_url() -> str:
 
 
 # ==========================
-# SELENIUM: DRIVER + LOGIN
+# REQUESTS SESSION
+# ==========================
+
+def _session_from_selenium_cookies(driver: webdriver.Chrome) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": REQUEST_UA,
+            "Accept-Language": "he,en;q=0.9",
+        }
+    )
+
+    for c in driver.get_cookies():
+        try:
+            s.cookies.set(
+                name=c.get("name"),
+                value=c.get("value"),
+                domain=c.get("domain"),
+                path=c.get("path", "/"),
+            )
+        except Exception:
+            pass
+
+    return s
+
+
+def _http_head_follow(session: requests.Session, url: str, referer: str | None = None) -> requests.Response | None:
+    headers = {}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        r = session.head(url, allow_redirects=True, timeout=30, headers=headers)
+        if r.status_code in (403, 405) or (r.status_code >= 400 and "Last-Modified" not in r.headers):
+            r = session.get(url, allow_redirects=True, timeout=30, stream=True, headers=headers)
+        return r
+    except Exception:
+        return None
+
+
+def _http_get_html(session: requests.Session, url: str, referer: str | None = None) -> str | None:
+    headers = {}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        r = session.get(url, allow_redirects=True, timeout=40, headers=headers)
+        if r.status_code >= 400:
+            return None
+        return r.text
+    except Exception:
+        return None
+
+
+def _ajax_call(session: requests.Session, sesskey: str, methodname: str, args: dict[str, Any], referer: str) -> Any:
+    url = f"{MOODLE_ROOT_URL}lib/ajax/service.php?sesskey={sesskey}&info={methodname}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": referer,
+        "Origin": MOODLE_ROOT_URL.rstrip("/"),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+    body = [{"index": 0, "methodname": methodname, "args": args}]
+    r = session.post(url, headers=headers, json=body, timeout=40)
+    r.raise_for_status()
+    data = r.json()
+
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"Unexpected AJAX response for {methodname}: {type(data)}")
+
+    first = data[0]
+    if isinstance(first, dict) and first.get("error"):
+        raise RuntimeError(f"Moodle AJAX error in {methodname}: {first}")
+
+    if isinstance(first, dict) and "data" in first:
+        return first["data"]
+    return first
+
+
+# ==========================
+# SELENIUM LOGIN
 # ==========================
 
 def build_driver() -> webdriver.Chrome:
     options = Options()
+    options.add_argument(f"--user-agent={REQUEST_UA}")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
-    options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--no-sandbox")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--window-size=1600,2200")
     if HEADLESS:
         options.add_argument("--headless=new")
     return webdriver.Chrome(options=options)
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
-    for v in values:
+    for value in values:
         try:
-            el = driver.find_element(by, v)
+            el = driver.find_element(by, value)
             if el.is_displayed() and el.is_enabled():
                 return el
         except Exception:
@@ -327,31 +445,26 @@ def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
 
 
 def maybe_login_nidp(driver: webdriver.Chrome) -> None:
-    """
-    Fill NIDP login form if present on the current page.
-    Tries multiple known field IDs used by TAU NIDP.
-    """
     wait = WebDriverWait(driver, WAIT_SEC)
 
     user_ids = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
-    pid_ids  = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
+    pid_ids = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
     pass_ids = ["Ecom_Password", "Ecom_Pass", "password", "pass"]
 
     def any_visible_login_field_present(d):
-        return (_find_any(d, By.ID, user_ids) is not None) or \
-               (_find_any(d, By.ID, pass_ids) is not None)
+        return (_find_any(d, By.ID, user_ids) is not None) or (_find_any(d, By.ID, pass_ids) is not None)
 
     try:
         wait.until(any_visible_login_field_present)
     except Exception:
-        print("  No login form detected — skipping NIDP fill.")
         return
 
-    def _safe_fill(el, value: str):
+    def _safe_fill(el, value: str) -> None:
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         except Exception:
             pass
+
         try:
             el.click()
         except Exception:
@@ -359,11 +472,11 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
                 driver.execute_script("arguments[0].click();", el)
             except Exception:
                 pass
+
         try:
             el.send_keys(Keys.CONTROL, "a")
             el.send_keys(Keys.BACKSPACE)
             el.send_keys(value)
-            return
         except Exception:
             driver.execute_script(
                 "arguments[0].value = arguments[1];"
@@ -382,289 +495,309 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
 
     pass_field = _find_any(driver, By.ID, pass_ids)
     if not pass_field:
-        print("  WARNING: password field not found on NIDP page!")
         return
 
     _safe_fill(pass_field, PASSWORD)
     pass_field.send_keys(Keys.RETURN)
-    print("  Submitted NIDP login form.")
 
 
-def ensure_on_moodle(driver: webdriver.Chrome) -> None:
-    """Wait until we land on moodle.tau.ac.il (handle NIDP portal redirect)."""
+def ensure_logged_in_to_sso(driver: webdriver.Chrome) -> None:
+    driver.get(LOGIN_URL)
+    maybe_login_nidp(driver)
+
     wait = WebDriverWait(driver, WAIT_SEC)
 
-    def reached_moodle_or_portal(d):
+    def no_longer_on_login_form(d):
         url = d.current_url.lower()
-        return ("moodle.tau.ac.il" in url) or ("nidp.tau.ac.il/nidp/portal" in url)
-
-    try:
-        wait.until(reached_moodle_or_portal)
-    except Exception:
-        print(f"  WARNING: still on {driver.current_url} after waiting.")
-
-    if "nidp.tau.ac.il/nidp/portal" in driver.current_url.lower():
-        print("  Landed on NIDP portal — navigating to Moodle MyCourses...")
-        driver.get(MY_COURSES_URL)
-
-    try:
-        wait.until(lambda d: "moodle.tau.ac.il" in d.current_url.lower())
-    except Exception:
-        raise RuntimeError(f"Could not reach moodle.tau.ac.il; stuck at: {driver.current_url}")
-
-    print(f"  On Moodle: {driver.current_url}")
-
-
-def _is_logged_in(driver: webdriver.Chrome) -> bool:
-    """
-    Return True if the current page shows a logged-in user.
-    We check for absence of 'התחבר' link and presence of user menu or user initials.
-    """
-    # If there's a visible login link, we're NOT logged in
-    try:
-        login_links = driver.find_elements(
-            By.XPATH,
-            "//a[contains(@href, '/login/index.php') and not(contains(@class,'sr-only'))]"
-        )
-        for a in login_links:
-            if a.is_displayed():
-                return False
-    except Exception:
-        pass
-
-    # If we can find the user menu toggle, we ARE logged in
-    try:
-        el = driver.find_element(By.CSS_SELECTOR, "#user-menu-toggle, .userinitials")
-        if el.is_displayed():
+        if "moodle.tau.ac.il" in url:
             return True
-    except Exception:
-        pass
+        if "nidp.tau.ac.il" in url:
+            html = d.page_source
+            if "Ecom_User_ID" not in html and "Ecom_Password" not in html:
+                return True
+        return False
 
-    # Check for "גישת אורחים" text
+    wait.until(no_longer_on_login_form)
+
+
+def _try_open_moodle_page_in_driver(driver: webdriver.Chrome, url: str) -> tuple[bool, str]:
     try:
-        body = driver.find_element(By.TAG_NAME, "body").text
-        if "גישת אורחים" in body:
-            return False
+        driver.get(url)
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(1.2)
+        title = driver.title or ""
+        html = driver.page_source or ""
+        blocked = _looks_like_tau_block_page(html, title)
+        print(f"DEBUG tried page {url} | title={title!r} | blocked={blocked}")
+        return (not blocked), html
+    except Exception as e:
+        print(f"DEBUG failed opening page {url}: {e}")
+        return False, ""
+
+
+# ==========================
+# COURSE LIST RETRIEVAL
+# ==========================
+
+def _extract_course_records_recursive(obj: Any, out: list[tuple[str, str]], seen: set[str]) -> None:
+    if isinstance(obj, dict):
+        course_id = obj.get("id")
+        fullname = obj.get("fullname") or obj.get("displayname") or obj.get("shortname")
+        maybe_url = obj.get("viewurl") or obj.get("url")
+
+        if course_id is not None and (fullname or maybe_url):
+            url = str(maybe_url) if maybe_url else f"{MOODLE_ROOT_URL}course/view.php?id={course_id}"
+            url = _normalize_url(url)
+            name = str(fullname) if fullname else url
+            if "/course/view.php?id=" in url and url not in seen:
+                out.append((name, url))
+                seen.add(url)
+
+        for value in obj.values():
+            _extract_course_records_recursive(value, out, seen)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_course_records_recursive(item, out, seen)
+
+
+def _get_courses_via_ajax(session: requests.Session, sesskey: str, referer: str) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    attempts: list[tuple[str, dict[str, Any]]] = [
+        (
+            "block_mycourses_get_enrolled_courses_by_timeline_classification",
+            {
+                "offset": 0,
+                "limit": 0,
+                "classification": "firstsemester",
+                "sort": "ul.timeaccess desc",
+                "customfieldname": "",
+                "customfieldvalue": "",
+                "groupmetacourses": 0,
+            },
+        ),
+        (
+            "block_mycourses_get_enrolled_courses_by_timeline_classification",
+            {
+                "offset": 0,
+                "limit": 0,
+                "classification": "all",
+                "sort": "ul.timeaccess desc",
+                "customfieldname": "",
+                "customfieldvalue": "",
+                "groupmetacourses": 0,
+            },
+        ),
+        (
+            "core_course_get_enrolled_courses_by_timeline_classification",
+            {"classification": "inprogress", "limit": 0, "offset": 0, "sort": "ul.timeaccess desc"},
+        ),
+        (
+            "core_course_get_enrolled_courses_by_timeline_classification",
+            {"classification": "future", "limit": 0, "offset": 0, "sort": "ul.timeaccess desc"},
+        ),
+        (
+            "core_course_get_enrolled_courses_by_timeline_classification",
+            {"classification": "past", "limit": 0, "offset": 0, "sort": "ul.timeaccess desc"},
+        ),
+    ]
+
+    for methodname, args in attempts:
+        try:
+            data = _ajax_call(session, sesskey, methodname, args, referer)
+            _extract_course_records_recursive(data, found, seen)
+            print(f"DEBUG AJAX {methodname} returned cumulative {len(found)} courses")
+            if found:
+                continue
+        except Exception as e:
+            print(f"DEBUG AJAX {methodname} failed: {e}")
+
+    return found
+
+
+def _get_courses_from_rendered_driver_page(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    try:
+        html = driver.page_source
     except Exception:
-        pass
+        return []
 
-    return True  # assume logged in if nothing contradicts
+    return _extract_course_links_from_html(html)
 
 
-def _wait_for_page_ready(driver: webdriver.Chrome, timeout: int = 30) -> None:
-    """Wait for document.readyState == 'complete'."""
-    WebDriverWait(driver, timeout).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
+def _get_first_accessible_moodle_html(session: requests.Session) -> tuple[str | None, str | None]:
+    for url in MOODLE_PAGE_CANDIDATES:
+        html = _http_get_html(session, url, referer=LOGIN_URL)
+        if not html:
+            continue
+        if _looks_like_tau_block_page(html, ""):
+            print(f"DEBUG requests page blocked: {url}")
+            continue
+        print(f"DEBUG requests page usable: {url}")
+        return url, html
+    return None, None
+
+
+def get_courses_after_login(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    usable_driver_html = ""
+    usable_driver_url = None
+
+    for url in MOODLE_PAGE_CANDIDATES:
+        ok, html = _try_open_moodle_page_in_driver(driver, url)
+        if ok:
+            usable_driver_html = html
+            usable_driver_url = url
+            break
+
+    if usable_driver_html:
+        courses = _extract_course_links_from_html(usable_driver_html)
+        if courses:
+            print(f"DEBUG got {len(courses)} courses directly from rendered driver page {usable_driver_url}")
+            save_course_cache(courses)
+            return courses
+
+    session = _session_from_selenium_cookies(driver)
+
+    html_url, html = _get_first_accessible_moodle_html(session)
+    if html:
+        courses = _extract_course_links_from_html(html)
+        if courses:
+            print(f"DEBUG got {len(courses)} courses directly from requests HTML {html_url}")
+            save_course_cache(courses)
+            return courses
+
+        sesskey = _extract_sesskey_from_html(html)
+        if sesskey:
+            print(f"DEBUG extracted sesskey from {html_url}")
+            ajax_courses = _get_courses_via_ajax(session, sesskey, html_url)
+            if ajax_courses:
+                print(f"DEBUG got {len(ajax_courses)} courses from Moodle AJAX")
+                save_course_cache(ajax_courses)
+                return ajax_courses
+        else:
+            print("DEBUG could not extract sesskey from usable Moodle HTML")
+
+    courses = _get_courses_from_rendered_driver_page(driver)
+    if courses:
+        print(f"DEBUG got {len(courses)} courses from late driver parse")
+        save_course_cache(courses)
+        return courses
+
+    cached = load_course_cache()
+    if cached:
+        print(f"DEBUG using cached course list ({len(cached)} courses)")
+        return cached
+
+    _debug_dump_page(driver, "debug_no_courses")
+    raise RuntimeError(
+        "Could not retrieve course list after SSO. "
+        "All Moodle landing pages were either blocked or returned no parsable course data."
     )
 
 
-def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
-    """
-    Navigate to MY_COURSES_URL and make sure we are authenticated.
-    If not logged in, trigger SSO flow and come back.
-    """
-    wait = WebDriverWait(driver, WAIT_SEC)
-
-    driver.get(MY_COURSES_URL)
-    _wait_for_page_ready(driver)
-    time.sleep(2)
-
-    print(f"  Current URL after get(MY_COURSES_URL): {driver.current_url}")
-
-    # If we ended up on NIDP (session expired / not logged in), do SSO
-    if "nidp.tau.ac.il" in driver.current_url.lower():
-        print("  Redirected to NIDP — logging in...")
-        maybe_login_nidp(driver)
-        ensure_on_moodle(driver)
-        _wait_for_page_ready(driver)
-        time.sleep(2)
-        # Navigate back to MY_COURSES_URL after SSO
-        driver.get(MY_COURSES_URL)
-        _wait_for_page_ready(driver)
-        time.sleep(2)
-
-    # If still showing guest / login link on Moodle page
-    if not _is_logged_in(driver):
-        print("  Not logged in on Moodle — clicking login link...")
-        # Try clicking any visible login link
-        try:
-            login_els = driver.find_elements(
-                By.XPATH,
-                "//a[contains(@href, '/login/index.php') and not(contains(@class,'sr-only'))]"
-            )
-            for a in login_els:
-                if a.is_displayed():
-                    driver.execute_script("arguments[0].click();", a)
-                    break
-        except Exception:
-            pass
-
-        time.sleep(2)
-
-        if "nidp.tau.ac.il" in driver.current_url.lower():
-            maybe_login_nidp(driver)
-            ensure_on_moodle(driver)
-            _wait_for_page_ready(driver)
-            time.sleep(2)
-
-        driver.get(MY_COURSES_URL)
-        _wait_for_page_ready(driver)
-        time.sleep(2)
-
-    if not _is_logged_in(driver):
-        raise RuntimeError(
-            f"Still not logged in to Moodle after SSO attempts. URL: {driver.current_url}"
-        )
-
-    print("  Confirmed logged in to Moodle.")
-
-
 # ==========================
-# GET COURSES
+# SCAN HELPERS
 # ==========================
 
-def _get_courses_from_calendar_select(driver: webdriver.Chrome) -> list[tuple[str, str]]:
-    """
-    Parse courses from the calendar course-filter <select>.
-    This element is in the static HTML (server-rendered), so it should be
-    available immediately after page load — no JS required.
-
-    The option values are course IDs (e.g. '509182907') and the text is the
-    full course name (e.g. '0509182907 - פיזיקה (2)').
-    """
-    courses = []
-    try:
-        # Wait up to 15 s for the calendar select to appear
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "select.cal_courses_flt"))
-        )
-        opts = driver.find_elements(By.CSS_SELECTOR, "select.cal_courses_flt option")
-        print(f"  Found {len(opts)} <option> elements in calendar select.")
-        for opt in opts:
-            value = (opt.get_attribute("value") or "").strip()
-            name  = (opt.text or "").strip()
-            # Skip "all courses" sentinel (value == "1") and blanks
-            if not value or value == "1" or not name:
-                continue
-            course_url = f"{MOODLE_BASE}/course/view.php?id={value}"
-            courses.append((name, course_url))
-            print(f"    course: {name!r} -> {course_url}")
-    except Exception as e:
-        print(f"  Warning: could not read calendar select: {e}")
-    return courses
-
-
-def _get_courses_from_page_source(driver: webdriver.Chrome) -> list[tuple[str, str]]:
-    """
-    Fallback: parse the raw page source with BeautifulSoup to find
-    select.cal_courses_flt options (avoids Selenium stale-element issues).
-    """
-    courses = []
-    try:
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        sel  = soup.select_one("select.cal_courses_flt")
-        if not sel:
-            print("  Fallback BS4: <select class='cal_courses_flt'> NOT found in page source.")
-            return courses
-        opts = sel.find_all("option")
-        print(f"  Fallback BS4: found {len(opts)} <option> in calendar select.")
-        for opt in opts:
-            value = (opt.get("value") or "").strip()
-            name  = (opt.get_text() or "").strip()
-            if not value or value == "1" or not name:
-                continue
-            course_url = f"{MOODLE_BASE}/course/view.php?id={value}"
-            courses.append((name, course_url))
-    except Exception as e:
-        print(f"  Warning in fallback BS4 parse: {e}")
-    return courses
-
-
-def _get_courses_from_dynamic_links(driver: webdriver.Chrome) -> list[tuple[str, str]]:
-    """
-    Last-resort: wait for JS-rendered course links.
-    Tries multiple CSS selectors that may match course links.
-    """
-    wait = WebDriverWait(driver, WAIT_SEC)
-    selectors = [
-        "a.mycourses_coursename",
-        "#block-mycourses a[href*='course/view.php?id=']",
-        ".block-mycourses a[href*='course/view.php?id=']",
-        "a[href*='course/view.php?id=']",
-    ]
-    for sel in selectors:
-        try:
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-            links = driver.find_elements(By.CSS_SELECTOR, sel)
-            courses = []
-            seen    = set()
-            for a in links:
-                name = (a.text or "").strip()
-                href = (a.get_attribute("href") or "").strip()
-                if not name or not href or "course/view.php?id=" not in href:
-                    continue
-                if href in seen:
-                    continue
-                seen.add(href)
-                courses.append((name, href))
-            if courses:
-                print(f"  Dynamic links via '{sel}': found {len(courses)} courses.")
-                return courses
-        except Exception:
+def _extract_pluginfile_links_from_html(html: str) -> list[tuple[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[tuple[str, str]] = []
+    for a in soup.select("a[href*='pluginfile.php']"):
+        href = a.get("href")
+        if not href:
             continue
-    return []
+        href = _normalize_url(href)
+        text = _clean_html_text(a.get_text(" ", strip=True))
+        out.append((href, text))
+    return out
 
 
-def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
-    ensure_logged_in_moodle(driver)
+def _extract_activity_links_from_course_html(html: str) -> tuple[set[str], set[str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    pluginfiles: set[str] = set()
+    activity_pages: set[str] = set()
 
-    # Give the page extra time to fully render the static HTML
-    time.sleep(3)
+    for a in soup.select("a[href]"):
+        href = a.get("href")
+        if not href:
+            continue
+        href = _normalize_url(href)
 
-    # --- Strategy 1: Selenium read of calendar <select> ---
-    courses = _get_courses_from_calendar_select(driver)
+        if "moodle.tau.ac.il/pluginfile.php/" in href:
+            pluginfiles.add(href)
+            continue
 
-    # --- Strategy 2: BeautifulSoup on raw page_source ---
-    if not courses:
-        print("  Calendar select via Selenium empty — trying BS4 on page source...")
-        courses = _get_courses_from_page_source(driver)
+        if "moodle.tau.ac.il/mod/resource/view.php" in href:
+            activity_pages.add(href)
+        elif "moodle.tau.ac.il/mod/folder/view.php" in href:
+            activity_pages.add(href)
+        elif "moodle.tau.ac.il/mod/assign/view.php" in href:
+            activity_pages.add(href)
 
-    # --- Strategy 3: wait for JS-rendered course card links ---
-    if not courses:
-        print("  BS4 also empty — waiting for dynamic JS course links...")
-        courses = _get_courses_from_dynamic_links(driver)
+    return pluginfiles, activity_pages
 
-    # Deduplicate by URL
-    seen = set()
-    uniq = []
-    for n, u in courses:
-        if u not in seen:
-            uniq.append((n, u))
-            seen.add(u)
 
-    print(f"  Total unique courses: {len(uniq)}")
-    return uniq
+def _resolve_resource_view_to_file(session: requests.Session, view_url: str) -> list[str]:
+    urls: list[str] = []
+
+    if "redirect=" not in view_url:
+        joiner = "&" if "?" in view_url else "?"
+        test_url = view_url + f"{joiner}redirect=1"
+    else:
+        test_url = view_url
+
+    r = _http_head_follow(session, test_url, referer=view_url)
+    if r is not None and r.url and "pluginfile.php" in r.url:
+        urls.append(_normalize_url(r.url))
+        return urls
+
+    html = _http_get_html(session, view_url, referer=view_url)
+    if not html:
+        return urls
+
+    for href, _txt in _extract_pluginfile_links_from_html(html):
+        urls.append(href)
+
+    return list(dict.fromkeys(urls))
+
+
+def _get_last_modified_for_file(session: requests.Session, file_url: str, referer: str | None = None) -> datetime | None:
+    r = _http_head_follow(session, file_url, referer=referer)
+    if not r:
+        return None
+    return _parse_http_last_modified(r.headers)
+
+
+def _normalize_link_for_print(original_link: str, pluginfile_link: str) -> str:
+    if (
+        "mod/resource/view.php" in original_link
+        or "mod/folder/view.php" in original_link
+        or "mod/assign/view.php" in original_link
+    ):
+        return original_link
+    return pluginfile_link
 
 
 # ==========================
 # MAIN SCAN LOGIC
 # ==========================
 
-def scan_all(
-    session: requests.Session,
-    courses: list[tuple[str, str]],
-    reference_dt: datetime,
-) -> list[FoundFile]:
+def scan_all(session: requests.Session, courses: list[tuple[str, str]], reference_dt: datetime) -> list[FoundFile]:
     found: list[FoundFile] = []
     seen_files: set[tuple[str, str]] = set()
 
     for course_name_raw, course_url in courses:
         course_name_display = _course_display_name(course_name_raw)
-        print(f"  Scanning: {course_name_display} ({course_url})")
+        print(f"DEBUG scanning course: {course_name_display} | {course_url}")
 
-        html = _http_get_html(session, course_url)
+        html = _http_get_html(session, course_url, referer=MOODLE_ROOT_URL)
         if not html:
-            print(f"    -> Could not fetch HTML for {course_url}")
+            print(f"DEBUG could not fetch course page: {course_url}")
+            continue
+
+        if _looks_like_tau_block_page(html, ""):
+            print(f"DEBUG course page blocked: {course_url}")
             continue
 
         pluginfiles, activity_pages = _extract_activity_links_from_course_html(html)
@@ -675,9 +808,10 @@ def scan_all(
                 continue
             seen_files.add(key)
 
-            lm = _get_last_modified_for_file(session, pf)
+            lm = _get_last_modified_for_file(session, pf, referer=course_url)
             if not lm:
                 continue
+
             if lm > reference_dt:
                 fname = _safe_filename_from_url(pf)
                 found.append(FoundFile(course_name_raw, course_name_display, fname, lm, pf))
@@ -690,35 +824,34 @@ def scan_all(
                     if key in seen_files:
                         continue
                     seen_files.add(key)
-                    lm = _get_last_modified_for_file(session, pf)
+
+                    lm = _get_last_modified_for_file(session, pf, referer=act)
                     if not lm:
                         continue
+
                     if lm > reference_dt:
-                        fname          = _safe_filename_from_url(pf)
+                        fname = _safe_filename_from_url(pf)
                         link_for_print = _normalize_link_for_print(act, pf)
-                        found.append(FoundFile(
-                            course_name_raw, course_name_display, fname, lm, link_for_print
-                        ))
+                        found.append(FoundFile(course_name_raw, course_name_display, fname, lm, link_for_print))
             else:
-                act_html = _http_get_html(session, act)
-                if not act_html:
+                act_html = _http_get_html(session, act, referer=course_url)
+                if not act_html or _looks_like_tau_block_page(act_html, ""):
                     continue
+
                 for pf, txt in _extract_pluginfile_links_from_html(act_html):
-                    if "pluginfile.php" not in pf:
-                        continue
                     key = (course_url, pf)
                     if key in seen_files:
                         continue
                     seen_files.add(key)
-                    lm = _get_last_modified_for_file(session, pf)
+
+                    lm = _get_last_modified_for_file(session, pf, referer=act)
                     if not lm:
                         continue
+
                     if lm > reference_dt:
-                        fname          = (txt.strip() or _safe_filename_from_url(pf))
+                        fname = (txt.strip() or _safe_filename_from_url(pf))
                         link_for_print = _normalize_link_for_print(act, pf)
-                        found.append(FoundFile(
-                            course_name_raw, course_name_display, fname, lm, link_for_print
-                        ))
+                        found.append(FoundFile(course_name_raw, course_name_display, fname, lm, link_for_print))
 
     found.sort(key=lambda x: (x.course_name_display, x.last_modified_il, x.file_name.lower()))
     return found
@@ -728,93 +861,33 @@ def scan_all(
 # ENTRY
 # ==========================
 
-def main():
+def main() -> None:
     if not USERNAME or not USER_ID or not PASSWORD:
-        raise SystemExit(
-            "Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD"
-        )
+        raise SystemExit("Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD")
 
     run_start = datetime.now(TZ_IL)
-    last_run  = load_last_run()
-    print(f"Last run: {last_run.strftime('%d.%m.%Y %H:%M %Z')}")
+    last_run = load_last_run()
 
     driver = build_driver()
     try:
-        # -------------------------------------------------------
-        # Step 1: Go directly to MY_COURSES_URL.
-        # If session is still valid from a previous run (cached cookies),
-        # we land straight on Moodle. If not, Moodle will redirect us to
-        # NIDP SSO, ensure_logged_in_moodle handles the full flow.
-        # -------------------------------------------------------
-        print("Navigating to MY_COURSES_URL to start login flow...")
-        driver.get(MY_COURSES_URL)
-        _wait_for_page_ready(driver)
-        time.sleep(2)
+        ensure_logged_in_to_sso(driver)
 
-        current = driver.current_url.lower()
-        print(f"After initial get, URL: {driver.current_url}")
-
-        if "nidp.tau.ac.il" in current:
-            # Redirected to NIDP SSO — fill login form
-            print("Redirected to NIDP — filling login form...")
-            maybe_login_nidp(driver)
-            ensure_on_moodle(driver)
-            _wait_for_page_ready(driver)
-            time.sleep(2)
-            # Navigate to MY_COURSES_URL now that we're authenticated
-            driver.get(MY_COURSES_URL)
-            _wait_for_page_ready(driver)
-            time.sleep(3)
-        elif "moodle.tau.ac.il" not in current:
-            # Unexpected URL — try the explicit NIDP LOGIN_URL as fallback
-            print(f"Unexpected URL {driver.current_url} — trying explicit NIDP login URL...")
-            driver.get(LOGIN_URL)
-            _wait_for_page_ready(driver)
-            maybe_login_nidp(driver)
-            ensure_on_moodle(driver)
-            _wait_for_page_ready(driver)
-            time.sleep(2)
-            driver.get(MY_COURSES_URL)
-            _wait_for_page_ready(driver)
-            time.sleep(3)
-
-        # -------------------------------------------------------
-        # Step 2: Verify login and get course list.
-        # get_courses() internally calls ensure_logged_in_moodle() as
-        # a safety net, then reads the calendar <select>.
-        # -------------------------------------------------------
-        courses = get_courses(driver)
+        courses = get_courses_after_login(driver)
         print(f"\nFound {len(courses)} courses.\n")
+        for i, (name, url) in enumerate(courses[:15], start=1):
+            print(f"DEBUG course {i}: {name} -> {url}")
 
-        if not courses:
-            raise RuntimeError(
-                "No courses found after login. "
-                "The calendar <select> was empty and no dynamic links were found. "
-                "Check that login succeeded and that the page rendered correctly."
-            )
-
-        # -------------------------------------------------------
-        # Step 3: Borrow Moodle session cookies for HTTP requests
-        # -------------------------------------------------------
         session = _session_from_selenium_cookies(driver)
-
-        # -------------------------------------------------------
-        # Step 4: Scan all courses for new/updated files
-        # -------------------------------------------------------
         results = scan_all(session, courses, last_run)
 
-        # Save state now (after successful scan)
         save_last_run(run_start)
 
         if not results:
-            print("No updates since last run. (No Telegram message sent.)")
+            print("No updates since last run. (No Telegram message will be sent.)")
             return
 
-        lines  = [_format_line(x) for x in results]
-        header = (
-            f"📌 עדכונים במודל מאז "
-            f"{last_run.strftime('%d.%m.%Y %H:%M')} ({len(lines)}):"
-        )
+        lines = [_format_line(x) for x in results]
+        header = f"📌 עדכונים במודל מאז {last_run.strftime('%d.%m.%Y %H:%M')} ({len(lines)}):"
         telegram_send_many(lines, header)
 
     finally:
@@ -827,9 +900,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception:
         run_link = github_run_url()
-        tb       = traceback.format_exc()
+        tb = traceback.format_exc()
 
         msg = "❌ Moodle scan failed (Exception)\n"
         if run_link:
