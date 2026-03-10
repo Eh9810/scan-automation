@@ -459,12 +459,14 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     """
     Go to MyCourses.
     If guest access -> click login -> complete SSO -> back to MyCourses.
+    Robust to both old and new MyCourses UI.
     """
     wait = WebDriverWait(driver, WAIT_SEC)
     driver.get(MY_COURSES_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     time.sleep(0.8)
 
+    # If we are guest, click "login" and go through SSO.
     if click_login_if_guest(driver):
         time.sleep(1.2)
 
@@ -475,32 +477,85 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         driver.get(MY_COURSES_URL)
 
     def courses_or_guest(d):
+        """
+        Condition for WebDriverWait:
+        - Either we see the old-style 'a.mycourses_coursename'
+        - Or we see any course link to /course/view.php?id=... on /local/mycourses/
+        - Or the page clearly says 'guest access'
+        """
+        # Old layout
         if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
             return True
-        if d.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
+
+        # New layout: React-based mycourses, look for course links
+        cur_url = d.current_url.lower()
+        if "local/mycourses" in cur_url:
+            links = d.find_elements(By.CSS_SELECTOR, "a[href*='/course/view.php?id=']")
+            if links:
+                return True
+
+        # Guest indicators (Hebrew/English)
+        page_html = d.page_source
+        guest_markers = ["גישת אורחים", "Guest access", "אורח במערכת"]
+        if any(g in page_html for g in guest_markers):
             return True
+
         return False
 
     wait.until(courses_or_guest)
 
+    # If after all that we are still guest – treat as error.
     if driver.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
         raise RuntimeError("Still guest access on MyCourses; SSO did not complete automatically.")
 
 
 def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    """
+    Return list of (course_name_raw, course_url) from MyCourses.
+    Supports both old (a.mycourses_coursename) and new layout
+    (generic a[href*='/course/view.php?id=']).
+    """
     ensure_logged_in_moodle(driver)
 
     wait = WebDriverWait(driver, WAIT_SEC)
-    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.mycourses_coursename")))
 
-    links = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
+    def course_links_present(d):
+        # Old layout
+        if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
+            return True
+
+        # New layout on /local/mycourses/
+        if "local/mycourses" in d.current_url.lower():
+            if d.find_elements(By.CSS_SELECTOR, "a[href*='/course/view.php?id=']"):
+                return True
+
+        return False
+
+    wait.until(course_links_present)
+
+    # Collect links from both selectors
+    links_elems = []
+    try:
+        links_elems.extend(driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"))
+    except Exception:
+        pass
+
+    try:
+        links_elems.extend(driver.find_elements(By.CSS_SELECTOR, "a[href*='/course/view.php?id=']"))
+    except Exception:
+        pass
+
     courses: list[tuple[str, str]] = []
-    for a in links:
-        name = (a.text or "").strip()
-        href = a.get_attribute("href")
-        if name and href and "course/view.php?id=" in href:
-            courses.append((name, href))
+    for a in links_elems:
+        try:
+            name = (a.text or "").strip()
+            href = a.get_attribute("href")
+            if name and href and "course/view.php?id=" in href:
+                courses.append((name, href))
+        except Exception:
+            continue
 
+    # Remove duplicates by URL
     uniq: list[tuple[str, str]] = []
     seen = set()
     for n, u in courses:
