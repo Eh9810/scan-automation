@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import unquote, urlparse
 import json
+import logging
 import os
 import re
 import time
@@ -22,6 +23,7 @@ import traceback
 
 import requests
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
@@ -51,6 +53,8 @@ WAIT_SEC = 30
 HEADLESS = True
 
 STATE_FILE = "last_run.json"  # will be created/updated in repo
+
+logger = logging.getLogger(__name__)
 
 
 # ==========================
@@ -455,35 +459,74 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
     return False
 
 
+_COURSE_CSS_SELECTORS = [
+    "a.mycourses_coursename",
+    "a[href*='course/view.php']",
+    ".coursebox a[href*='course/view.php']",
+    "[data-courseurl] a",
+    "div.course_title a",
+]
+
+_GUEST_XPATH = "//*[contains(., 'גישת אורחים')]"
+
+
+def _courses_detected(d) -> bool:
+    """Return True if any course-list element or guest-access indicator is found."""
+    for sel in _COURSE_CSS_SELECTORS:
+        if d.find_elements(By.CSS_SELECTOR, sel):
+            return True
+    if d.find_elements(By.XPATH, _GUEST_XPATH):
+        return True
+    return False
+
+
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     """
     Go to MyCourses.
     If guest access -> click login -> complete SSO -> back to MyCourses.
+    Retries with a page refresh if the first wait times out.
     """
     wait = WebDriverWait(driver, WAIT_SEC)
+    logger.info("Navigating to MyCourses: %s", MY_COURSES_URL)
     driver.get(MY_COURSES_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(0.8)
+    time.sleep(1.5)
 
     if click_login_if_guest(driver):
-        time.sleep(1.2)
+        logger.info("Guest access detected – clicking login link")
+        time.sleep(2)
 
         if "nidp.tau.ac.il" in driver.current_url.lower():
+            logger.info("Redirected to NIDP – filling SSO form")
             maybe_login_nidp(driver)
             ensure_on_moodle(driver)
 
+        logger.info("Returning to MyCourses after SSO")
         driver.get(MY_COURSES_URL)
 
-    def courses_or_guest(d):
-        if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
-            return True
-        if d.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
-            return True
-        return False
+    try:
+        wait.until(_courses_detected)
+        logger.info("Course list detected on first attempt")
+    except TimeoutException:
+        logger.warning(
+            "Timeout waiting for courses (url=%s) – refreshing page and retrying",
+            driver.current_url,
+        )
+        driver.refresh()
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(1.5)
+        try:
+            wait.until(_courses_detected)
+            logger.info("Course list detected after page refresh")
+        except TimeoutException:
+            logger.error(
+                "Still no course list after refresh. Page title: %s | URL: %s",
+                driver.title,
+                driver.current_url,
+            )
+            raise
 
-    wait.until(courses_or_guest)
-
-    if driver.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
+    if driver.find_elements(By.XPATH, _GUEST_XPATH):
         raise RuntimeError("Still guest access on MyCourses; SSO did not complete automatically.")
 
 
@@ -491,9 +534,19 @@ def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     ensure_logged_in_moodle(driver)
 
     wait = WebDriverWait(driver, WAIT_SEC)
-    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.mycourses_coursename")))
 
-    links = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
+    # Try the primary selector first; fall back to any course link if not found
+    try:
+        wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.mycourses_coursename")))
+        links = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
+        logger.info("Found %d elements via primary selector 'a.mycourses_coursename'", len(links))
+    except TimeoutException:
+        logger.warning(
+            "Primary course selector timed out – falling back to generic course link selector"
+        )
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href*='course/view.php']")
+        logger.info("Found %d elements via fallback selector 'a[href*=course/view.php]'", len(links))
+
     courses: list[tuple[str, str]] = []
     for a in links:
         name = (a.text or "").strip()
@@ -501,12 +554,21 @@ def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
         if name and href and "course/view.php?id=" in href:
             courses.append((name, href))
 
+    if not courses:
+        logger.warning(
+            "No courses found on MyCourses page (url=%s, title=%s). "
+            "The page structure may have changed.",
+            driver.current_url,
+            driver.title,
+        )
+
     uniq: list[tuple[str, str]] = []
     seen = set()
     for n, u in courses:
         if u not in seen:
             uniq.append((n, u))
             seen.add(u)
+    logger.info("Returning %d unique courses", len(uniq))
     return uniq
 
 
@@ -590,6 +652,7 @@ def scan_all(session: requests.Session, courses: list[tuple[str, str]], referenc
 # ==========================
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # validate required secrets
     if not USERNAME or not USER_ID or not PASSWORD:
         raise SystemExit("Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD")
