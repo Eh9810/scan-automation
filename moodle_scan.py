@@ -1,16 +1,13 @@
-from __future__ import annotations
-
 # -*- coding: utf-8 -*-
 """
-TAU Moodle scanner (GitHub Actions-ready)
-
-Flow:
-1) Start from Moodle-side login flow (not generic NIDP URL)
-2) Login to TAU NIDP via Selenium
-3) Return from NIDP to Moodle and establish Moodle session
-4) Collect enrolled course links
-5) Scan course pages for files changed since last run
-6) Send Telegram only when there are updates
+TAU Moodle scanner (GitHub Actions-ready):
+- Login to TAU NIDP (SSO) via Selenium headless Chrome
+- Go to My Courses
+- Scan course pages for pluginfile links + resolve resource/folder/assign
+- Use HTTP Last-Modified as "שינוי אחרון"
+- Check only what changed since last run (stored in last_run.json)
+- If there are updates -> send Telegram message (no updates -> send nothing)
+- If there is an error -> send Telegram message with the GitHub Actions run link + traceback
 """
 
 from dataclasses import dataclass
@@ -25,9 +22,11 @@ import traceback
 
 import requests
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 try:
     from bs4 import BeautifulSoup
@@ -44,22 +43,21 @@ except ImportError:
 # CONFIG
 # ==========================
 
-MOODLE_ROOT_URL = "https://moodle.tau.ac.il/"
+LOGIN_URL = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential&sid=0"
 MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
-LOGIN_INDEX_URL = "https://moodle.tau.ac.il/login/index.php"
-SAML_LOGIN_URL = "https://moodle.tau.ac.il/auth/saml2/login.php"
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
-WAIT_SEC = 35
+WAIT_SEC = 30
 HEADLESS = True
 
-STATE_FILE = "last_run.json"
+STATE_FILE = "last_run.json"  # will be created/updated in repo
 
 
 # ==========================
-# SECRETS
+# SECRETS (from GitHub Actions)
 # ==========================
-
+# IMPORTANT: do NOT hardcode secrets here.
+# Put them in GitHub -> Settings -> Secrets and variables -> Actions -> Secrets.
 USERNAME = os.environ.get("MOODLE_USERNAME", "")
 USER_ID = os.environ.get("MOODLE_USER_ID", "")
 PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
@@ -86,6 +84,10 @@ class FoundFile:
 # ==========================
 
 def _course_display_name(raw: str) -> str:
+    """
+    Convert '05092843 - אנליזה הרמונית' -> 'אנליזה הרמונית'
+    Keep others as-is.
+    """
     s = (raw or "").strip()
     if " - " in s:
         left, right = s.split(" - ", 1)
@@ -113,446 +115,6 @@ def _parse_http_last_modified(headers) -> datetime | None:
     except Exception:
         return None
 
-
-def _current_url(driver: webdriver.Chrome) -> str:
-    try:
-        return driver.current_url
-    except Exception:
-        return ""
-
-
-def _current_title(driver: webdriver.Chrome) -> str:
-    try:
-        return driver.title
-    except Exception:
-        return ""
-
-
-def _current_html(driver: webdriver.Chrome) -> str:
-    try:
-        return driver.page_source
-    except Exception:
-        return ""
-
-
-def _page_looks_blocked(html: str, title: str = "", url: str = "") -> bool:
-    text = f"{title}\n{url}\n{html}".lower()
-    markers = [
-        "tau under maintenence",
-        "tau under maintenance",
-        "access denied",
-        "בקשה נדחתה",
-        "your support id is:",
-        "please try again, or contact us for support",
-        "אנא נסו שוב, או צרו קשר עם מרכז התמיכה",
-    ]
-    return any(m in text for m in markers)
-
-
-def _has_moodle_session_cookie(driver: webdriver.Chrome) -> bool:
-    try:
-        for c in driver.get_cookies():
-            name = (c.get("name") or "").lower()
-            domain = (c.get("domain") or "").lower()
-            if "moodle" in domain and name.startswith("moodlesession"):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _page_has_logged_in_signs(driver: webdriver.Chrome) -> bool:
-    html = _current_html(driver)
-    if not html:
-        return False
-    markers = [
-        "logout.php",
-        "sesskey",
-        "data-region=\"mycourses\"",
-        "course/view.php?id=",
-        "usermenu",
-        "loginas",
-    ]
-    h = html.lower()
-    return any(m.lower() in h for m in markers)
-
-
-def _debug_dump_page(driver: webdriver.Chrome, prefix: str) -> None:
-    current_url = _current_url(driver)
-    title = _current_title(driver)
-    page_source = _current_html(driver)
-
-    print(f"DEBUG {prefix} current_url: {current_url}")
-    print(f"DEBUG {prefix} title: {title}")
-    print(f"DEBUG {prefix} page source snippet:\n{page_source[:5000]}")
-
-    try:
-        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
-            f.write(page_source)
-        print(f"DEBUG saved HTML to {prefix}.html")
-    except Exception as e:
-        print(f"DEBUG failed saving HTML: {e}")
-
-    try:
-        driver.save_screenshot(f"{prefix}.png")
-        print(f"DEBUG saved screenshot to {prefix}.png")
-    except Exception as e:
-        print(f"DEBUG failed saving screenshot: {e}")
-
-
-def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
-    for v in values:
-        try:
-            el = driver.find_element(by, v)
-            if el.is_displayed() and el.is_enabled():
-                return el
-        except Exception:
-            continue
-    return None
-
-
-def _safe_fill(driver: webdriver.Chrome, el, value: str) -> None:
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-    except Exception:
-        pass
-
-    try:
-        el.click()
-    except Exception:
-        try:
-            driver.execute_script("arguments[0].click();", el)
-        except Exception:
-            pass
-
-    try:
-        el.send_keys(Keys.CONTROL, "a")
-        el.send_keys(Keys.BACKSPACE)
-        el.send_keys(value)
-        return
-    except Exception:
-        pass
-
-    driver.execute_script(
-        "arguments[0].value = arguments[1];"
-        "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
-        "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
-        el, value
-    )
-
-
-def _click_first(driver: webdriver.Chrome, selectors: list[tuple[str, str]]) -> bool:
-    for by, value in selectors:
-        try:
-            els = driver.find_elements(by, value)
-            for el in els:
-                if el.is_displayed() and el.is_enabled():
-                    driver.execute_script("arguments[0].click();", el)
-                    time.sleep(1.5)
-                    return True
-        except Exception:
-            continue
-    return False
-
-
-def _submit_any_form_or_continue(driver: webdriver.Chrome) -> bool:
-    selectors = [
-        (By.XPATH, "//button[@type='submit']"),
-        (By.XPATH, "//input[@type='submit']"),
-        (By.XPATH, "//button[contains(normalize-space(.), 'Continue')]"),
-        (By.XPATH, "//button[contains(normalize-space(.), 'continue')]"),
-        (By.XPATH, "//button[contains(normalize-space(.), 'המשך')]"),
-        (By.XPATH, "//button[contains(normalize-space(.), 'כניסה')]"),
-        (By.XPATH, "//input[@value='Continue']"),
-        (By.XPATH, "//input[@value='continue']"),
-        (By.XPATH, "//input[@value='כניסה']"),
-    ]
-    if _click_first(driver, selectors):
-        return True
-
-    try:
-        forms = driver.find_elements(By.TAG_NAME, "form")
-        for form in forms:
-            if form.is_displayed():
-                driver.execute_script("arguments[0].submit();", form)
-                time.sleep(1.5)
-                return True
-    except Exception:
-        pass
-    return False
-
-
-# ==========================
-# STATE
-# ==========================
-
-def load_last_run() -> datetime:
-    fallback = datetime.now(TZ_IL) - timedelta(hours=1)
-
-    if not os.path.exists(STATE_FILE):
-        return fallback
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        iso = data.get("last_run_iso")
-        if not iso:
-            return fallback
-        dt = datetime.fromisoformat(iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ_IL)
-        return dt.astimezone(TZ_IL)
-    except Exception:
-        return fallback
-
-
-def save_last_run(run_start: datetime) -> None:
-    data = {"last_run_iso": run_start.astimezone(TZ_IL).isoformat()}
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-# ==========================
-# TELEGRAM
-# ==========================
-
-def telegram_send(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram secrets missing; skipping send.")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(url, json=payload, timeout=30)
-    print(r.text)
-
-
-def telegram_send_many(lines: list[str], header: str) -> None:
-    max_len = 3800
-    chunk = header + "\n"
-    for line in lines:
-        if len(chunk) + len(line) + 1 > max_len:
-            telegram_send(chunk)
-            chunk = header + "\n"
-        chunk += line + "\n"
-    if chunk.strip():
-        telegram_send(chunk)
-
-
-def github_run_url() -> str:
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    run_id = os.environ.get("GITHUB_RUN_ID", "")
-    if repo and run_id:
-        return f"https://github.com/{repo}/actions/runs/{run_id}"
-    return ""
-
-
-# ==========================
-# SELENIUM: DRIVER + LOGIN
-# ==========================
-
-def build_driver() -> webdriver.Chrome:
-    options = Options()
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1600,2200")
-    options.add_argument("--lang=he-IL")
-    if HEADLESS:
-        options.add_argument("--headless=new")
-    return webdriver.Chrome(options=options)
-
-
-def open_moodle_side_login_flow(driver: webdriver.Chrome) -> None:
-    """
-    Critical fix:
-    start from Moodle-side SAML flow, NOT from the generic NIDP URL.
-    Otherwise TAU authenticates the user but drops them into /nidp/portal.
-    """
-    candidate_urls = [
-        MY_COURSES_URL,
-        LOGIN_INDEX_URL,
-        SAML_LOGIN_URL,
-    ]
-
-    for url in candidate_urls:
-        driver.get(url)
-        time.sleep(2.0)
-
-        cur = _current_url(driver).lower()
-        title = _current_title(driver)
-        html = _current_html(driver)
-
-        if "nidp.tau.ac.il" in cur:
-            return
-
-        if _page_looks_blocked(html, title, cur):
-            print(f"DEBUG start page blocked: {url}")
-            continue
-
-        selectors = [
-            (By.CSS_SELECTOR, "a[href*='/auth/saml2/login.php']"),
-            (By.CSS_SELECTOR, "a[href*='/login/index.php']"),
-            (By.XPATH, "//a[contains(normalize-space(.), 'התחבר/י')]"),
-            (By.XPATH, "//a[contains(normalize-space(.), 'התחבר')]"),
-            (By.XPATH, "//a[contains(normalize-space(.), 'Login')]"),
-            (By.XPATH, "//a[contains(normalize-space(.), 'Sign in')]"),
-        ]
-
-        if _click_first(driver, selectors):
-            time.sleep(2.0)
-            if "nidp.tau.ac.il" in _current_url(driver).lower():
-                return
-
-    _debug_dump_page(driver, "debug_could_not_open_moodle_login_flow")
-    raise RuntimeError("Could not start Moodle-side login flow.")
-
-
-def fill_nidp_credentials(driver: webdriver.Chrome) -> None:
-    user_ids = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
-    pid_ids = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
-    pass_ids = ["Ecom_Password", "Ecom_Pass", "password", "pass"]
-
-    deadline = time.time() + WAIT_SEC
-    while time.time() < deadline:
-        cur = _current_url(driver).lower()
-        if "nidp.tau.ac.il" not in cur:
-            time.sleep(1.0)
-            continue
-
-        user_field = _find_any(driver, By.ID, user_ids)
-        pass_field = _find_any(driver, By.ID, pass_ids)
-        pid_field = _find_any(driver, By.ID, pid_ids)
-
-        if user_field and pass_field:
-            _safe_fill(driver, user_field, USERNAME)
-            if pid_field:
-                _safe_fill(driver, pid_field, USER_ID)
-            _safe_fill(driver, pass_field, PASSWORD)
-            pass_field.send_keys(Keys.RETURN)
-            time.sleep(2.0)
-            return
-
-        if _submit_any_form_or_continue(driver):
-            continue
-
-        time.sleep(1.0)
-
-    _debug_dump_page(driver, "debug_nidp_form_missing")
-    raise RuntimeError("Could not find TAU NIDP login form.")
-
-
-def wait_for_moodle_session(driver: webdriver.Chrome) -> None:
-    deadline = time.time() + 90
-    saml_reentry_attempts = 0
-
-    while time.time() < deadline:
-        cur = _current_url(driver)
-        cur_l = cur.lower()
-        title = _current_title(driver)
-        html = _current_html(driver)
-
-        if "moodle.tau.ac.il" in cur_l and not _page_looks_blocked(html, title, cur):
-            if _has_moodle_session_cookie(driver) or _page_has_logged_in_signs(driver):
-                return
-
-        if "nidp.tau.ac.il/nidp/portal" in cur_l:
-            if saml_reentry_attempts < 5:
-                driver.get(SAML_LOGIN_URL)
-                saml_reentry_attempts += 1
-                time.sleep(2.0)
-                _submit_any_form_or_continue(driver)
-                continue
-
-        if "nidp.tau.ac.il" in cur_l:
-            if _submit_any_form_or_continue(driver):
-                continue
-
-        if "moodle.tau.ac.il/auth/saml2/login.php" in cur_l:
-            if _submit_any_form_or_continue(driver):
-                continue
-
-        time.sleep(1.0)
-
-    _debug_dump_page(driver, "debug_no_session_after_nidp")
-    raise RuntimeError("NIDP login finished, but Moodle session was not established afterwards.")
-
-
-def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
-    open_moodle_side_login_flow(driver)
-    fill_nidp_credentials(driver)
-    wait_for_moodle_session(driver)
-
-    driver.get(MY_COURSES_URL)
-    time.sleep(2.0)
-
-    if _page_looks_blocked(_current_html(driver), _current_title(driver), _current_url(driver)):
-        driver.get(SAML_LOGIN_URL)
-        time.sleep(2.0)
-        wait_for_moodle_session(driver)
-        driver.get(MY_COURSES_URL)
-        time.sleep(2.0)
-
-
-def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
-    ensure_logged_in_moodle(driver)
-
-    courses: list[tuple[str, str]] = []
-    seen = set()
-
-    driver.get(MY_COURSES_URL)
-    time.sleep(3.0)
-
-    html = _current_html(driver)
-    title = _current_title(driver)
-    cur = _current_url(driver)
-
-    blocked = _page_looks_blocked(html, title, cur)
-    print(f"DEBUG tried page {MY_COURSES_URL} | title={title!r} | blocked={blocked}")
-
-    if blocked:
-        _debug_dump_page(driver, "debug_no_courses_found")
-        raise RuntimeError("MyCourses page is blocked even after login.")
-
-    soup = BeautifulSoup(html, "html.parser")
-    candidates = []
-
-    for a in soup.select("a.mycourses_coursename[href]"):
-        href = (a.get("href") or "").strip()
-        name = (a.get_text(" ", strip=True) or "").strip()
-        if "course/view.php?id=" in href:
-            candidates.append((name or href, href))
-
-    for a in soup.select("a[href*='/course/view.php?id=']"):
-        href = (a.get("href") or "").strip()
-        name = (a.get_text(" ", strip=True) or "").strip()
-        if href:
-            candidates.append((name or href, href))
-
-    for name, href in candidates:
-        if href not in seen:
-            courses.append((name, href))
-            seen.add(href)
-
-    print(f"DEBUG collected {len(courses)} course links")
-    for idx, (n, u) in enumerate(courses[:20], start=1):
-        print(f"DEBUG course {idx}: {n} -> {u}")
-
-    if not courses:
-        _debug_dump_page(driver, "debug_no_courses_found")
-        raise RuntimeError("No course links were found on MyCourses page.")
-
-    return courses
-
-
-# ==========================
-# HTTP SCAN HELPERS
-# ==========================
 
 def _session_from_selenium_cookies(driver: webdriver.Chrome) -> requests.Session:
     s = requests.Session()
@@ -679,6 +241,276 @@ def _format_line(item: FoundFile) -> str:
 
 
 # ==========================
+# STATE (last run)
+# ==========================
+
+def load_last_run() -> datetime:
+    # default: last hour (so first run won't spam months)
+    fallback = datetime.now(TZ_IL) - timedelta(hours=1)
+
+    if not os.path.exists(STATE_FILE):
+        return fallback
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        iso = data.get("last_run_iso")
+        if not iso:
+            return fallback
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ_IL)
+        return dt.astimezone(TZ_IL)
+    except Exception:
+        return fallback
+
+
+def save_last_run(run_start: datetime) -> None:
+    data = {"last_run_iso": run_start.astimezone(TZ_IL).isoformat()}
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# ==========================
+# TELEGRAM
+# ==========================
+
+def telegram_send(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secrets missing; skipping send.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, json=payload, timeout=30)
+    print(r.text)
+
+
+def telegram_send_many(lines: list[str], header: str) -> None:
+    # Telegram limit ~4096 chars per message → split safely
+    max_len = 3800
+    chunk = header + "\n"
+    for line in lines:
+        if len(chunk) + len(line) + 1 > max_len:
+            telegram_send(chunk)
+            chunk = header + "\n"
+        chunk += line + "\n"
+    if chunk.strip():
+        telegram_send(chunk)
+
+
+def github_run_url() -> str:
+    # https://github.com/<owner>/<repo>/actions/runs/<run_id>
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if repo and run_id:
+        return f"https://github.com/{repo}/actions/runs/{run_id}"
+    return ""
+
+
+# ==========================
+# SELENIUM: DRIVER + LOGIN
+# ==========================
+
+def build_driver() -> webdriver.Chrome:
+    options = Options()
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    if HEADLESS:
+        options.add_argument("--headless=new")
+    # Selenium Manager will download/install matching driver automatically on GitHub runners
+    return webdriver.Chrome(options=options)
+
+
+def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
+    """
+    Return the first element that is BOTH displayed and enabled.
+    (Prevents picking hidden/overlayed fields that cause ElementNotInteractableException)
+    """
+    for v in values:
+        try:
+            el = driver.find_element(by, v)
+            if el.is_displayed() and el.is_enabled():
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def maybe_login_nidp(driver: webdriver.Chrome) -> None:
+    """
+    Fill the TAU NIDP SSO form if it appears.
+    Robust against multiple possible field IDs AND hidden duplicates.
+    """
+    wait = WebDriverWait(driver, WAIT_SEC)
+
+    user_ids = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
+    pid_ids  = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
+    pass_ids = ["Ecom_Password", "Ecom_Pass", "password", "pass"]
+
+    def any_visible_login_field_present(d):
+        return (_find_any(d, By.ID, user_ids) is not None) or (_find_any(d, By.ID, pass_ids) is not None)
+
+    try:
+        wait.until(any_visible_login_field_present)
+    except Exception:
+        # no login form detected
+        return
+
+    def _safe_fill(el, value: str):
+        # scroll + focus
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        except Exception:
+            pass
+
+        try:
+            el.click()
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].click();", el)
+            except Exception:
+                pass
+
+        # clear via keyboard (more reliable than clear())
+        try:
+            el.send_keys(Keys.CONTROL, "a")
+            el.send_keys(Keys.BACKSPACE)
+            el.send_keys(value)
+            return
+        except Exception:
+            # last resort: set via JS + fire input/change
+            driver.execute_script(
+                "arguments[0].value = arguments[1];"
+                "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+                "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                el, value
+            )
+
+    user_field = _find_any(driver, By.ID, user_ids)
+    if user_field:
+        _safe_fill(user_field, USERNAME)
+
+    pid_field = _find_any(driver, By.ID, pid_ids)
+    if pid_field:
+        _safe_fill(pid_field, USER_ID)
+
+    pass_field = _find_any(driver, By.ID, pass_ids)
+    if not pass_field:
+        return
+
+    _safe_fill(pass_field, PASSWORD)
+    pass_field.send_keys(Keys.RETURN)
+
+
+def ensure_on_moodle(driver: webdriver.Chrome) -> None:
+    wait = WebDriverWait(driver, WAIT_SEC)
+
+    def reached_moodle_or_portal(d):
+        url = d.current_url.lower()
+        return ("moodle.tau.ac.il" in url) or ("nidp.tau.ac.il/nidp/portal" in url)
+
+    try:
+        wait.until(reached_moodle_or_portal)
+    except Exception:
+        pass
+
+    if "nidp.tau.ac.il/nidp/portal" in driver.current_url.lower():
+        driver.get(MY_COURSES_URL)
+
+    wait.until(lambda d: "moodle.tau.ac.il" in d.current_url.lower())
+
+
+def click_login_if_guest(driver: webdriver.Chrome) -> bool:
+    selectors = [
+        "#usernavigation a[href*='/login/index.php']",
+        "a[href='https://moodle.tau.ac.il/login/index.php']",
+        "a[href*='moodle.tau.ac.il/login/index.php']",
+    ]
+
+    for sel in selectors:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            if el and el.is_displayed():
+                driver.execute_script("arguments[0].click();", el)
+                return True
+        except Exception:
+            pass
+
+    try:
+        els = driver.find_elements(By.XPATH, "//a[contains(normalize-space(.), 'התחבר')]")
+        for el in els:
+            if el.is_displayed():
+                driver.execute_script("arguments[0].click();", el)
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
+    """
+    Go to MyCourses.
+    If guest access -> click login -> complete SSO -> back to MyCourses.
+    """
+    wait = WebDriverWait(driver, WAIT_SEC)
+    driver.get(MY_COURSES_URL)
+    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    time.sleep(0.8)
+
+    if click_login_if_guest(driver):
+        time.sleep(1.2)
+
+        if "nidp.tau.ac.il" in driver.current_url.lower():
+            maybe_login_nidp(driver)
+            ensure_on_moodle(driver)
+
+        driver.get(MY_COURSES_URL)
+
+    def courses_or_guest(d):
+        if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
+            return True
+        if d.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
+            return True
+        return False
+
+    wait.until(courses_or_guest)
+
+    if driver.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
+        raise RuntimeError("Still guest access on MyCourses; SSO did not complete automatically.")
+
+
+def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    ensure_logged_in_moodle(driver)
+
+    wait = WebDriverWait(driver, WAIT_SEC)
+    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.mycourses_coursename")))
+
+    links = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
+    courses: list[tuple[str, str]] = []
+    for a in links:
+        name = (a.text or "").strip()
+        href = a.get_attribute("href")
+        if name and href and "course/view.php?id=" in href:
+            courses.append((name, href))
+
+    uniq: list[tuple[str, str]] = []
+    seen = set()
+    for n, u in courses:
+        if u not in seen:
+            uniq.append((n, u))
+            seen.add(u)
+    return uniq
+
+
+# ==========================
 # MAIN SCAN LOGIC
 # ==========================
 
@@ -758,6 +590,7 @@ def scan_all(session: requests.Session, courses: list[tuple[str, str]], referenc
 # ==========================
 
 def main():
+    # validate required secrets
     if not USERNAME or not USER_ID or not PASSWORD:
         raise SystemExit("Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD")
 
@@ -766,12 +599,19 @@ def main():
 
     driver = build_driver()
     try:
+        driver.get(LOGIN_URL)
+
+        # if we see NIDP form -> fill; otherwise might already be logged in
+        maybe_login_nidp(driver)
+        ensure_on_moodle(driver)
+
         courses = get_courses(driver)
         print(f"\nFound {len(courses)} courses.\n")
 
         session = _session_from_selenium_cookies(driver)
         results = scan_all(session, courses, last_run)
 
+        # Update state even if no results (so next run checks only since now)
         save_last_run(run_start)
 
         if not results:
@@ -792,7 +632,8 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except Exception as e:
+        # send error to Telegram (very important)
         run_link = github_run_url()
         tb = traceback.format_exc()
 
@@ -801,6 +642,7 @@ if __name__ == "__main__":
             msg += f"🔗 Logs: {run_link}\n\n"
         msg += tb
 
+        # Telegram has length limits; clip a bit
         if len(msg) > 3800:
             msg = msg[:3800] + "\n...\n(Traceback clipped)"
 
