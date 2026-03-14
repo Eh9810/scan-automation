@@ -432,6 +432,9 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
         "#usernavigation a[href*='/login/index.php']",
         "a[href='https://moodle.tau.ac.il/login/index.php']",
         "a[href*='moodle.tau.ac.il/login/index.php']",
+        "a[href*='/login/index.php']",
+        "a[href*='nidp.tau.ac.il']",
+        "button[data-action='login']",
     ]
 
     for sel in selectors:
@@ -452,7 +455,37 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
     except Exception:
         pass
 
+    try:
+        els = driver.find_elements(
+            By.XPATH,
+            "//a[contains(normalize-space(.), 'כניסה') or contains(normalize-space(.), 'Login') or contains(normalize-space(.), 'Sign in')]",
+        )
+        for el in els:
+            if el.is_displayed():
+                driver.execute_script("arguments[0].click();", el)
+                return True
+    except Exception:
+        pass
+
     return False
+
+
+def _find_course_links(driver: webdriver.Chrome):
+    """Support multiple MyCourses DOM variants (class names changed over time)."""
+    selectors = [
+        "a.mycourses_coursename",
+        "a.coursename",
+        "a[href*='/course/view.php?id=']",
+    ]
+    links = []
+    for sel in selectors:
+        try:
+            links = driver.find_elements(By.CSS_SELECTOR, sel)
+        except Exception:
+            links = []
+        if links:
+            break
+    return links
 
 
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
@@ -475,9 +508,11 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         driver.get(MY_COURSES_URL)
 
     def courses_or_guest(d):
-        if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
+        if _find_course_links(d):
             return True
         if d.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
+            return True
+        if d.find_elements(By.XPATH, "//a[contains(@href, '/login/index.php')]"):
             return True
         return False
 
@@ -491,9 +526,9 @@ def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     ensure_logged_in_moodle(driver)
 
     wait = WebDriverWait(driver, WAIT_SEC)
-    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.mycourses_coursename")))
+    wait.until(lambda d: len(_find_course_links(d)) > 0)
 
-    links = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
+    links = _find_course_links(driver)
     courses: list[tuple[str, str]] = []
     for a in links:
         name = (a.text or "").strip()
