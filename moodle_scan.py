@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import unquote, urlparse
 import json
+import logging
 import os
 import re
 import time
@@ -47,10 +48,21 @@ LOGIN_URL = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential
 MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
-WAIT_SEC = 30
+WAIT_SEC = 60
 HEADLESS = True
 
 STATE_FILE = "last_run.json"  # will be created/updated in repo
+
+
+# ==========================
+# LOGGING
+# ==========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
 
 
 # ==========================
@@ -231,6 +243,58 @@ def _normalize_link_for_print(original_link: str, pluginfile_link: str) -> str:
     return pluginfile_link
 
 
+def take_debug_screenshot(driver: webdriver.Chrome, name: str = "screenshot") -> None:
+    """Save a screenshot to /tmp for debugging purposes.
+
+    Args:
+        driver: The Selenium WebDriver instance.
+        name:   A short descriptive label used in the output filename,
+                e.g. ``"login_timeout"`` → ``/tmp/debug_login_timeout_<ts>.png``.
+    """
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"/tmp/debug_{name}_{ts}.png"
+        driver.save_screenshot(path)
+        log.info("Screenshot saved: %s", path)
+    except Exception as exc:
+        log.warning("Could not save screenshot: %s", exc)
+
+
+def _retry_with_backoff(func, retries: int = 3, initial_delay: float = 2.0):
+    """Retry *func* up to *retries* times with exponential backoff on failure.
+
+    Args:
+        func:          A zero-argument callable to invoke.
+        retries:       Maximum number of attempts (must be >= 1).
+        initial_delay: Seconds to wait before the second attempt; doubles each time.
+
+    Returns:
+        The return value of *func* on the first successful invocation.
+
+    Raises:
+        The last exception raised by *func* if every attempt fails.
+        ValueError: If *retries* < 1.
+    """
+    if retries < 1:
+        raise ValueError(f"retries must be >= 1, got {retries}")
+    delay = initial_delay
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return func()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                log.warning(
+                    "Attempt %d/%d failed: %s — retrying in %.1fs",
+                    attempt + 1, retries, exc, delay,
+                )
+                time.sleep(delay)
+                delay *= 2
+    assert last_exc is not None  # guaranteed: retries >= 1 so loop ran at least once
+    raise last_exc
+
+
 def _format_line(item: FoundFile) -> str:
     return (
         f"{item.course_name_display}\t | "
@@ -348,6 +412,7 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
     Fill the TAU NIDP SSO form if it appears.
     Robust against multiple possible field IDs AND hidden duplicates.
     """
+    log.info("maybe_login_nidp: current url=%s", driver.current_url)
     wait = WebDriverWait(driver, WAIT_SEC)
 
     user_ids = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
@@ -361,7 +426,10 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
         wait.until(any_visible_login_field_present)
     except Exception:
         # no login form detected
+        log.info("maybe_login_nidp: no login form detected — skipping")
         return
+
+    log.info("maybe_login_nidp: login form detected — filling credentials")
 
     def _safe_fill(el, value: str):
         # scroll + focus
@@ -403,13 +471,16 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
 
     pass_field = _find_any(driver, By.ID, pass_ids)
     if not pass_field:
+        log.warning("maybe_login_nidp: password field not found — cannot submit form")
         return
 
     _safe_fill(pass_field, PASSWORD)
+    log.info("maybe_login_nidp: submitting login form")
     pass_field.send_keys(Keys.RETURN)
 
 
 def ensure_on_moodle(driver: webdriver.Chrome) -> None:
+    log.info("ensure_on_moodle: waiting to reach moodle.tau.ac.il (current url=%s)", driver.current_url)
     wait = WebDriverWait(driver, WAIT_SEC)
 
     def reached_moodle_or_portal(d):
@@ -419,15 +490,19 @@ def ensure_on_moodle(driver: webdriver.Chrome) -> None:
     try:
         wait.until(reached_moodle_or_portal)
     except Exception:
-        pass
+        log.warning("ensure_on_moodle: timed out waiting for moodle/portal — current url=%s", driver.current_url)
+        take_debug_screenshot(driver, "ensure_on_moodle_timeout")
 
     if "nidp.tau.ac.il/nidp/portal" in driver.current_url.lower():
+        log.info("ensure_on_moodle: reached NIDP portal — navigating to MY_COURSES_URL")
         driver.get(MY_COURSES_URL)
 
     wait.until(lambda d: "moodle.tau.ac.il" in d.current_url.lower())
+    log.info("ensure_on_moodle: reached moodle — url=%s", driver.current_url)
 
 
 def click_login_if_guest(driver: webdriver.Chrome) -> bool:
+    log.info("click_login_if_guest: checking for guest/login link (url=%s)", driver.current_url)
     selectors = [
         "#usernavigation a[href*='/login/index.php']",
         "a[href='https://moodle.tau.ac.il/login/index.php']",
@@ -438,6 +513,7 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
         try:
             el = driver.find_element(By.CSS_SELECTOR, sel)
             if el and el.is_displayed():
+                log.info("click_login_if_guest: clicking selector=%r", sel)
                 driver.execute_script("arguments[0].click();", el)
                 return True
         except Exception:
@@ -447,20 +523,45 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
         els = driver.find_elements(By.XPATH, "//a[contains(normalize-space(.), 'התחבר')]")
         for el in els:
             if el.is_displayed():
+                log.info("click_login_if_guest: clicking 'התחבר' link")
                 driver.execute_script("arguments[0].click();", el)
                 return True
     except Exception:
         pass
 
+    log.info("click_login_if_guest: no guest/login link found")
     return False
 
 
 def _collect_course_anchors(driver: webdriver.Chrome):
     """
     Collect anchors that look like Moodle course links.
+    Tries multiple CSS selectors for robustness across different Moodle themes.
     Avoid filtering by visibility because some themes render links in hidden tabs/containers first.
     """
-    return driver.find_elements(By.CSS_SELECTOR, "a[href*='course/view.php?id=']")
+    seen_hrefs: set[str] = set()
+    results = []
+
+    selectors = [
+        "a[href*='course/view.php?id=']",
+        "a[href*='/course/view.php']",
+        ".coursebox a[href*='course']",
+        "[data-courseid] a",
+        ".course-info-container a[href*='course']",
+        ".coursecat-section a[href*='course/view.php']",
+    ]
+
+    for sel in selectors:
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                href = (el.get_attribute("href") or "").strip()
+                if "course/view.php" in href and href not in seen_hrefs:
+                    seen_hrefs.add(href)
+                    results.append(el)
+        except Exception:
+            continue
+
+    return results
 
 
 def _looks_like_courses_page(driver: webdriver.Chrome) -> bool:
@@ -481,9 +582,11 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     Go to MyCourses.
     If guest access -> click login -> complete SSO -> back to MyCourses.
     """
+    log.info("ensure_logged_in_moodle: starting (url=%s)", driver.current_url)
     wait = WebDriverWait(driver, WAIT_SEC)
 
     def _run_login_flow_once() -> None:
+        log.info("_run_login_flow_once: navigating to MY_COURSES_URL")
         driver.get(MY_COURSES_URL)
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(0.8)
@@ -492,9 +595,11 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
             time.sleep(1.2)
 
         if "nidp.tau.ac.il" in driver.current_url.lower():
+            log.info("_run_login_flow_once: NIDP detected — running SSO")
             maybe_login_nidp(driver)
             ensure_on_moodle(driver)
 
+        log.info("_run_login_flow_once: returning to MY_COURSES_URL")
         driver.get(MY_COURSES_URL)
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
@@ -511,32 +616,51 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
 
     try:
         wait.until(courses_or_guest)
-    except Exception:
-        # Fallback: force full SSO flow once more and retry.
-        driver.get(LOGIN_URL)
-        maybe_login_nidp(driver)
-        ensure_on_moodle(driver)
-        _run_login_flow_once()
+        log.info("ensure_logged_in_moodle: courses/guest page reached — url=%s", driver.current_url)
+    except Exception as first_exc:
+        log.warning(
+            "ensure_logged_in_moodle: first attempt timed out (%s) — taking screenshot and retrying full SSO flow",
+            first_exc,
+        )
+        take_debug_screenshot(driver, "ensure_logged_in_first_timeout")
+
+        def _full_sso_retry():
+            log.info("ensure_logged_in_moodle: forcing full SSO via LOGIN_URL")
+            driver.get(LOGIN_URL)
+            maybe_login_nidp(driver)
+            ensure_on_moodle(driver)
+            _run_login_flow_once()
+
+        try:
+            _retry_with_backoff(_full_sso_retry, retries=2, initial_delay=3.0)
+        except Exception:
+            pass
+
         try:
             wait.until(courses_or_guest)
+            log.info("ensure_logged_in_moodle: courses/guest page reached after retry — url=%s", driver.current_url)
         except Exception as inner_exc:
             url = driver.current_url
             title = driver.title
+            take_debug_screenshot(driver, "ensure_logged_in_final_timeout")
             raise RuntimeError(
                 f"Failed to reach Moodle courses page. url={url!r} title={title!r}"
             ) from inner_exc
 
     if driver.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
+        take_debug_screenshot(driver, "still_guest_access")
         raise RuntimeError("Still guest access on MyCourses; SSO did not complete automatically.")
 
 
 def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    log.info("get_courses: starting")
     ensure_logged_in_moodle(driver)
 
     wait = WebDriverWait(driver, WAIT_SEC)
     wait.until(lambda d: _looks_like_courses_page(d))
 
     links = _collect_course_anchors(driver)
+    log.info("get_courses: found %d raw course anchor(s)", len(links))
     courses: list[tuple[str, str]] = []
     for a in links:
         name = ((a.text or "").strip() or (a.get_attribute("title") or "").strip())
@@ -555,6 +679,7 @@ def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
         if u not in seen:
             uniq.append((n, u))
             seen.add(u)
+    log.info("get_courses: returning %d unique course(s)", len(uniq))
     return uniq
 
 
@@ -644,9 +769,11 @@ def main():
 
     run_start = datetime.now(TZ_IL)
     last_run = load_last_run()
+    log.info("main: run_start=%s  last_run=%s", run_start.isoformat(), last_run.isoformat())
 
     driver = build_driver()
     try:
+        log.info("main: navigating to LOGIN_URL")
         driver.get(LOGIN_URL)
 
         # if we see NIDP form -> fill; otherwise might already be logged in
@@ -654,15 +781,18 @@ def main():
         ensure_on_moodle(driver)
 
         courses = get_courses(driver)
+        log.info("main: found %d courses", len(courses))
         print(f"\nFound {len(courses)} courses.\n")
 
         session = _session_from_selenium_cookies(driver)
         results = scan_all(session, courses, last_run)
+        log.info("main: scan_all returned %d updated file(s)", len(results))
 
         # Update state even if no results (so next run checks only since now)
         save_last_run(run_start)
 
         if not results:
+            log.info("main: no updates since last run — no Telegram message sent")
             print("No updates since last run. (No Telegram message will be sent.)")
             return
 
