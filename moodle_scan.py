@@ -26,6 +26,7 @@ import traceback
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
@@ -33,6 +34,12 @@ try:
     from bs4 import BeautifulSoup
 except ImportError:
     raise SystemExit("Missing bs4. Install: pip install beautifulsoup4")
+
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    _WDM_AVAILABLE = True
+except ImportError:
+    _WDM_AVAILABLE = False
 
 try:
     from zoneinfo import ZoneInfo
@@ -365,6 +372,11 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--lang=he-IL")
     if HEADLESS:
         options.add_argument("--headless=new")
+    if _WDM_AVAILABLE:
+        try:
+            return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        except Exception:
+            pass
     return webdriver.Chrome(options=options)
 
 
