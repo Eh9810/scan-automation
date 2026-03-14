@@ -41,6 +41,10 @@ except ImportError:
     raise SystemExit("Missing zoneinfo (Python 3.9+).")
 
 
+class MoodleMaintenanceError(Exception):
+    """Raised when Moodle is showing a maintenance page."""
+
+
 # ==========================
 # CONFIG
 # ==========================
@@ -470,6 +474,12 @@ _COURSE_CSS_SELECTORS = [
 _GUEST_XPATH = "//*[contains(., 'גישת אורחים')]"
 
 
+def _is_maintenance_page(driver: webdriver.Chrome) -> bool:
+    """Return True if the current page appears to be a Moodle maintenance page."""
+    title = (driver.title or "").lower()
+    return "maintenance" in title
+
+
 def _courses_detected(d) -> bool:
     """Return True if any course-list element or guest-access indicator is found."""
     for sel in _COURSE_CSS_SELECTORS:
@@ -485,12 +495,18 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     Go to MyCourses.
     If guest access -> click login -> complete SSO -> back to MyCourses.
     Retries with a page refresh if the first wait times out.
+    Raises MoodleMaintenanceError if Moodle is under maintenance.
     """
     wait = WebDriverWait(driver, WAIT_SEC)
     logger.info("Navigating to MyCourses: %s", MY_COURSES_URL)
     driver.get(MY_COURSES_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     time.sleep(1.5)
+
+    if _is_maintenance_page(driver):
+        raise MoodleMaintenanceError(
+            f"Moodle is under maintenance (page title: '{driver.title}')"
+        )
 
     if click_login_if_guest(driver):
         logger.info("Guest access detected – clicking login link")
@@ -503,11 +519,21 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
 
         logger.info("Returning to MyCourses after SSO")
         driver.get(MY_COURSES_URL)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+        if _is_maintenance_page(driver):
+            raise MoodleMaintenanceError(
+                f"Moodle is under maintenance (page title: '{driver.title}')"
+            )
 
     try:
         wait.until(_courses_detected)
         logger.info("Course list detected on first attempt")
     except TimeoutException:
+        if _is_maintenance_page(driver):
+            raise MoodleMaintenanceError(
+                f"Moodle is under maintenance (page title: '{driver.title}')"
+            )
         logger.warning(
             "Timeout waiting for courses (url=%s) – refreshing page and retrying",
             driver.current_url,
@@ -515,6 +541,10 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         driver.refresh()
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(1.5)
+        if _is_maintenance_page(driver):
+            raise MoodleMaintenanceError(
+                f"Moodle is under maintenance (page title: '{driver.title}')"
+            )
         try:
             wait.until(_courses_detected)
             logger.info("Course list detected after page refresh")
@@ -695,6 +725,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except MoodleMaintenanceError as e:
+        logger.warning("Moodle is under maintenance – skipping this run. (%s)", e)
+        # Exit cleanly (no Telegram error, no non-zero exit code)
     except Exception as e:
         # send error to Telegram (very important)
         run_link = github_run_url()
