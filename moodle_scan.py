@@ -457,18 +457,23 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
 
 def _collect_course_anchors(driver: webdriver.Chrome):
     """
-    Collect visible anchors that look like Moodle course links.
-    Keep this broad to survive markup/class changes in MyCourses pages.
+    Collect anchors that look like Moodle course links.
+    Avoid filtering by visibility because some themes render links in hidden tabs/containers first.
     """
-    candidates = driver.find_elements(By.CSS_SELECTOR, "a[href*='course/view.php?id=']")
-    visible = []
-    for el in candidates:
-        try:
-            if el.is_displayed():
-                visible.append(el)
-        except Exception:
-            continue
-    return visible
+    return driver.find_elements(By.CSS_SELECTOR, "a[href*='course/view.php?id=']")
+
+
+def _looks_like_courses_page(driver: webdriver.Chrome) -> bool:
+    url = (driver.current_url or "").lower()
+    page = (driver.page_source or "")
+
+    if _collect_course_anchors(driver):
+        return True
+    if "course/view.php?id=" in page:
+        return True
+    if "/local/mycourses" in url:
+        return True
+    return False
 
 
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
@@ -477,21 +482,24 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     If guest access -> click login -> complete SSO -> back to MyCourses.
     """
     wait = WebDriverWait(driver, WAIT_SEC)
-    driver.get(MY_COURSES_URL)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(0.8)
 
-    if click_login_if_guest(driver):
-        time.sleep(1.2)
+    def _run_login_flow_once() -> None:
+        driver.get(MY_COURSES_URL)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(0.8)
+
+        if click_login_if_guest(driver):
+            time.sleep(1.2)
 
         if "nidp.tau.ac.il" in driver.current_url.lower():
             maybe_login_nidp(driver)
             ensure_on_moodle(driver)
 
         driver.get(MY_COURSES_URL)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
     def courses_or_guest(d):
-        if _collect_course_anchors(d):
+        if _looks_like_courses_page(d):
             return True
         if d.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
             return True
@@ -499,18 +507,24 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
             return True
         return False
 
+    _run_login_flow_once()
+
     try:
         wait.until(courses_or_guest)
     except Exception:
-        # Fallback: if Moodle bounced us back to a login page, retry once through SSO.
-        if driver.find_elements(By.CSS_SELECTOR, "a[href*='/login/index.php']") or "login" in driver.current_url.lower():
-            driver.get(LOGIN_URL)
-            maybe_login_nidp(driver)
-            ensure_on_moodle(driver)
-            driver.get(MY_COURSES_URL)
+        # Fallback: force full SSO flow once more and retry.
+        driver.get(LOGIN_URL)
+        maybe_login_nidp(driver)
+        ensure_on_moodle(driver)
+        _run_login_flow_once()
+        try:
             wait.until(courses_or_guest)
-        else:
-            raise
+        except Exception as inner_exc:
+            url = driver.current_url
+            title = driver.title
+            raise RuntimeError(
+                f"Failed to reach Moodle courses page. url={url!r} title={title!r}"
+            ) from inner_exc
 
     if driver.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
         raise RuntimeError("Still guest access on MyCourses; SSO did not complete automatically.")
@@ -520,15 +534,20 @@ def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     ensure_logged_in_moodle(driver)
 
     wait = WebDriverWait(driver, WAIT_SEC)
-    wait.until(lambda d: len(_collect_course_anchors(d)) > 0)
+    wait.until(lambda d: _looks_like_courses_page(d))
 
     links = _collect_course_anchors(driver)
     courses: list[tuple[str, str]] = []
     for a in links:
-        name = (a.text or "").strip()
+        name = ((a.text or "").strip() or (a.get_attribute("title") or "").strip())
+        if not name:
+            try:
+                name = (driver.execute_script("return (arguments[0].textContent || '').trim();", a) or "").strip()
+            except Exception:
+                name = ""
         href = a.get_attribute("href")
-        if name and href and "course/view.php?id=" in href:
-            courses.append((name, href))
+        if href and "course/view.php?id=" in href:
+            courses.append((name or href, href))
 
     uniq: list[tuple[str, str]] = []
     seen = set()
