@@ -475,9 +475,13 @@ _GUEST_XPATH = "//*[contains(., 'גישת אורחים')]"
 
 
 def _is_maintenance_page(driver: webdriver.Chrome) -> bool:
-    """Return True if the current page appears to be a Moodle maintenance page."""
+    """Return True if the current page appears to be a Moodle maintenance page.
+
+    The actual page title uses the misspelling "Maintenence", so we match on
+    the common prefix "mainten" to catch all spelling variants.
+    """
     title = (driver.title or "").lower()
-    return "maintenance" in title
+    return "mainten" in title
 
 
 def _courses_detected(d) -> bool:
