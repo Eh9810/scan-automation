@@ -26,6 +26,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install selenium requests beautifulsoup4
 
+      - name: Restore Moodle session cache
+        # run_id makes the key unique so the cache is always saved after each run.
+        # restore-keys finds the most recent saved cache via prefix match.
+        uses: actions/cache@v4
+        with:
+          path: moodle_cookies.json
+          key: moodle-session-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            moodle-session-${{ runner.os }}-
+
       - name: Run scanner
         env:
           MOODLE_USERNAME: ${{ secrets.MOODLE_USERNAME }}

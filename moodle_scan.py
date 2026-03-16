@@ -58,12 +58,18 @@ WAIT_SEC = 30
 HEADLESS = True
 
 STATE_FILE = "last_run.json"  # will be created/updated in repo
+COOKIES_FILE = "moodle_cookies.json"  # listed in .gitignore; persisted via actions/cache
 MAINTENANCE_NOTIFY_THROTTLE_HOURS = 4  # send at most one maintenance alert per this many hours
 MAINTENANCE_RETRY_COUNT = 2      # retry this many extra times before giving up on maintenance
 MAINTENANCE_RETRY_DELAY_SEC = 60  # seconds to wait between maintenance retries
 
 logger = logging.getLogger(__name__)
 
+# Shared browser User-Agent used for all HTTP sessions.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 # ==========================
 # SECRETS (from GitHub Actions)
@@ -207,10 +213,7 @@ def _http_saml_login() -> "requests.Session | None":
     """
     session = requests.Session()
     session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": _BROWSER_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
     })
@@ -220,20 +223,34 @@ def _http_saml_login() -> "requests.Session | None":
         logger.info("HTTP login step 1: GET %s", LOGIN_URL)
         resp = session.get(LOGIN_URL, timeout=30)
         resp.raise_for_status()
+        logger.info("HTTP login step 1: landed on %s (status=%s)", resp.url, resp.status_code)
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        form = soup.find("form")
+        # Prefer the form that has a password field; fall back to the first form.
+        form = None
+        for f in soup.find_all("form"):
+            if f.find("input", {"type": "password"}):
+                form = f
+                break
         if not form:
-            logger.warning("HTTP login: no <form> on NIDP login page – cannot proceed")
+            form = soup.find("form")
+        if not form:
+            title = soup.find("title")
+            logger.warning(
+                "HTTP login: no <form> on NIDP login page (title=%r) – cannot proceed",
+                title.get_text() if title else "",
+            )
             return None
 
         action, data = _form_to_dict(form, resp.url)
+        logger.info("HTTP login step 1: form action=%s, fields=%s", action, list(data.keys()))
         _fill_nidp_credentials(data)
 
         # ── 2. Submit credentials to NIDP ────────────────────────────────────
         logger.info("HTTP login step 2: POST credentials to %s", action)
         resp = session.post(action, data=data, timeout=30)
         resp.raise_for_status()
+        logger.info("HTTP login step 2: response URL=%s status=%s", resp.url, resp.status_code)
 
         # ── 3. POST SAMLResponse to Moodle ACS ───────────────────────────────
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -252,6 +269,7 @@ def _http_saml_login() -> "requests.Session | None":
         logger.info("HTTP login step 3: POST SAMLResponse to Moodle ACS %s", acs_url)
         resp = session.post(acs_url, data=saml_data, timeout=30)
         resp.raise_for_status()
+        logger.info("HTTP login step 3: response URL=%s status=%s", resp.url, resp.status_code)
 
         # ── 4. Verify Moodle landing page ────────────────────────────────────
         if "moodle.tau.ac.il" not in resp.url:
@@ -261,6 +279,7 @@ def _http_saml_login() -> "requests.Session | None":
         soup = BeautifulSoup(resp.text, "html.parser")
         title_el = soup.find("title")
         title_text = title_el.get_text() if title_el else ""
+        # "mainten" matches both the correct spelling and the TAU server's misspelling "Maintenence"
         if "mainten" in title_text.lower():
             logger.warning(
                 "HTTP login: maintenance page on landing URL %s (title=%r)",
@@ -482,6 +501,81 @@ def save_maintenance_notified(dt: datetime) -> None:
 
 
 # ==========================
+# SESSION COOKIE PERSISTENCE
+# (cached by GitHub Actions; COOKIES_FILE is in .gitignore)
+# ==========================
+
+def save_http_session_cookies(session: requests.Session) -> None:
+    """Persist Moodle session cookies to COOKIES_FILE for reuse in the next run."""
+    cookies = [
+        {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
+        for c in session.cookies
+        if c.domain and "tau.ac.il" in c.domain
+    ]
+    if not cookies:
+        logger.warning("save_http_session_cookies: no tau.ac.il cookies in session to save")
+        return
+    try:
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, ensure_ascii=False)
+        logger.info("Saved %d session cookies to %s", len(cookies), COOKIES_FILE)
+    except Exception as exc:
+        logger.warning("Could not save cookies: %s", exc)
+
+
+def load_http_session_from_cookies() -> "requests.Session | None":
+    """
+    Try to restore a Moodle HTTP session from COOKIES_FILE (written by the previous run).
+    Verifies the cookies are still valid by fetching the Moodle dashboard.
+    Returns a working requests.Session, or None if the file is missing/cookies are expired.
+    """
+    if not os.path.exists(COOKIES_FILE):
+        logger.info("Cookie file %s not found – fresh login required", COOKIES_FILE)
+        return None
+    try:
+        with open(COOKIES_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+    except Exception as exc:
+        logger.warning("Cookie file unreadable: %s", exc)
+        return None
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+    })
+    for c in saved:
+        session.cookies.set(
+            name=c["name"],
+            value=c["value"],
+            domain=c.get("domain"),
+            path=c.get("path", "/"),
+        )
+
+    # Verify the session is still valid against the Moodle dashboard.
+    logger.info("Verifying saved cookies against %s", MOODLE_DASHBOARD_URL)
+    html = _http_get_html(session, MOODLE_DASHBOARD_URL)
+    if not html:
+        logger.warning("Cookie reuse: Moodle dashboard unreachable")
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    title_el = soup.find("title")
+    title_text = (title_el.get_text() if title_el else "").lower()
+
+    if "mainten" in title_text:
+        logger.warning("Cookie reuse: maintenance page (title=%r)", title_text)
+        return None
+    if "log in" in title_text or "login" in title_text or "sign in" in title_text:
+        logger.warning("Cookie reuse: redirected to login – cookies expired (title=%r)", title_text)
+        return None
+
+    logger.info("Cookie reuse: session still valid (dashboard title=%r)", title_text)
+    return session
+
+
+# ==========================
 # TELEGRAM
 # ==========================
 
@@ -532,10 +626,19 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    # Anti-fingerprinting: hide automation indicators from the server
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
     if HEADLESS:
         options.add_argument("--headless=new")
     # Selenium Manager will download/install matching driver automatically on GitHub runners
-    return webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=options)
+    # Mask navigator.webdriver so the server can't detect headless Chrome
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    })
+    return driver
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
@@ -913,9 +1016,17 @@ def main():
     run_start = datetime.now(TZ_IL)
     last_run = load_last_run()
 
-    # ── Attempt 1: HTTP-based SAML login (no Selenium; avoids headless-Chrome bot detection) ──
-    logger.info("Attempting HTTP-based SAML login (no browser)…")
-    http_session = _http_saml_login()
+    # ── Attempt 0: Reuse saved session cookies (fastest – no login round-trip) ──
+    logger.info("Trying to reuse saved Moodle session cookies…")
+    http_session = load_http_session_from_cookies()
+
+    if http_session is None:
+        # ── Attempt 1: HTTP-based SAML login (no Selenium; avoids headless-Chrome bot detection) ──
+        logger.info("Attempting HTTP-based SAML login (no browser)…")
+        http_session = _http_saml_login()
+        if http_session is not None:
+            save_http_session_cookies(http_session)
+
     if http_session is not None:
         courses = _get_courses_via_http(http_session)
         if courses:
@@ -946,6 +1057,8 @@ def main():
         print(f"\nFound {len(courses)} courses.\n")
 
         session = _session_from_selenium_cookies(driver)
+        # Cache cookies so the next run can skip Selenium entirely
+        save_http_session_cookies(session)
         results = scan_all(session, courses, last_run)
 
         # Update state even if no results (so next run checks only since now)
