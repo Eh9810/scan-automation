@@ -190,6 +190,21 @@ def _extract_activity_links_from_course_html(html: str) -> tuple[set[str], set[s
     return pluginfiles, activity_pages
 
 
+def _extract_course_links_from_html(html: str) -> list[tuple[str, str]]:
+    """Parse course links from any Moodle page HTML variant."""
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[tuple[str, str]] = []
+    for a in soup.select("a[href*='course/view.php?id=']"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        text = (a.get_text(" ", strip=True) or "").strip()
+        if not text:
+            text = href
+        out.append((text, href))
+    return out
+
+
 def _resolve_resource_view_to_file(session: requests.Session, view_url: str) -> list[str]:
     urls: list[str] = []
 
@@ -432,6 +447,9 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
         "#usernavigation a[href*='/login/index.php']",
         "a[href='https://moodle.tau.ac.il/login/index.php']",
         "a[href*='moodle.tau.ac.il/login/index.php']",
+        "a[href*='/login/index.php']",
+        "a[href*='nidp.tau.ac.il']",
+        "button[data-action='login']",
     ]
 
     for sel in selectors:
@@ -452,7 +470,92 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
     except Exception:
         pass
 
+    try:
+        els = driver.find_elements(
+            By.XPATH,
+            "//a[contains(normalize-space(.), 'כניסה') or contains(normalize-space(.), 'Login') or contains(normalize-space(.), 'Sign in')]",
+        )
+        for el in els:
+            if el.is_displayed():
+                driver.execute_script("arguments[0].click();", el)
+                return True
+    except Exception:
+        pass
+
     return False
+
+
+def _is_guest_page(driver: webdriver.Chrome) -> bool:
+    guest_indicators = [
+        "//*[contains(., 'גישת אורחים')]",
+        "//*[contains(., 'Guest access')]",
+        "//*[contains(., 'You are currently using guest access')]",
+    ]
+    for xp in guest_indicators:
+        try:
+            if driver.find_elements(By.XPATH, xp):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _has_login_link(driver: webdriver.Chrome) -> bool:
+    checks = [
+        "//a[contains(@href, '/login/index.php')]",
+        "//a[contains(@href, 'nidp.tau.ac.il')]",
+        "//button[@data-action='login']",
+    ]
+    for xp in checks:
+        try:
+            if driver.find_elements(By.XPATH, xp):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _find_course_links(driver: webdriver.Chrome):
+    """Support multiple MyCourses DOM variants (class names changed over time)."""
+    selectors = [
+        "a.mycourses_coursename",
+        "a.coursename",
+        "a[href*='/course/view.php?id=']",
+    ]
+    links = []
+    for sel in selectors:
+        try:
+            links = driver.find_elements(By.CSS_SELECTOR, sel)
+        except Exception:
+            links = []
+        if links:
+            break
+    return links
+
+
+def _unique_courses(courses: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    uniq: list[tuple[str, str]] = []
+    seen = set()
+    for n, u in courses:
+        if not u or "course/view.php?id=" not in u:
+            continue
+        if u in seen:
+            continue
+        uniq.append((n.strip() or u, u))
+        seen.add(u)
+    return uniq
+
+
+def _courses_from_current_dom(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    courses: list[tuple[str, str]] = []
+    for a in _find_course_links(driver):
+        try:
+            name = (a.text or "").strip()
+            href = a.get_attribute("href")
+            courses.append((name, href))
+        except Exception:
+            continue
+    return _unique_courses(courses)
 
 
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
@@ -461,53 +564,78 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     If guest access -> click login -> complete SSO -> back to MyCourses.
     """
     wait = WebDriverWait(driver, WAIT_SEC)
-    driver.get(MY_COURSES_URL)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(0.8)
+    last_state = "unknown"
+    for attempt in range(1, 4):
+        driver.get(MY_COURSES_URL)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(0.8)
 
-    if click_login_if_guest(driver):
-        time.sleep(1.2)
+        clicked_login = click_login_if_guest(driver)
+        if clicked_login:
+            print(f"[login] attempt {attempt}: clicked login link/button")
+            time.sleep(1.2)
 
         if "nidp.tau.ac.il" in driver.current_url.lower():
+            print(f"[login] attempt {attempt}: on NIDP, trying form fill")
             maybe_login_nidp(driver)
             ensure_on_moodle(driver)
+            driver.get(MY_COURSES_URL)
 
-        driver.get(MY_COURSES_URL)
+        # success condition: we actually got course links
+        if _find_course_links(driver):
+            return
 
-    def courses_or_guest(d):
-        if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
-            return True
-        if d.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
-            return True
-        return False
+        # if page still looks like guest/login, retry a fresh cycle
+        if _is_guest_page(driver) or _has_login_link(driver):
+            last_state = "guest_or_login"
+            print(f"[login] attempt {attempt}: still guest/login page, retrying")
+            continue
 
-    wait.until(courses_or_guest)
+        # unknown state: break and let detailed error below describe it
+        last_state = "unknown_page"
+        break
 
-    if driver.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
-        raise RuntimeError("Still guest access on MyCourses; SSO did not complete automatically.")
+    # Do not wait again here: previous wait caused opaque TimeoutException.
+    # Fail with actionable diagnostics instead.
+    page_excerpt = (driver.page_source or "")[:4000]
+    raise RuntimeError(
+        "Could not reach logged-in MyCourses state after retries. "
+        f"state={last_state}\n"
+        f"url={driver.current_url}\n"
+        f"title={driver.title}\n"
+        f"page_excerpt={page_excerpt}"
+    )
 
 
 def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     ensure_logged_in_moodle(driver)
 
-    wait = WebDriverWait(driver, WAIT_SEC)
-    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.mycourses_coursename")))
+    # 1) Fast path: links in current DOM
+    courses = _courses_from_current_dom(driver)
+    if courses:
+        return courses
 
-    links = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
-    courses: list[tuple[str, str]] = []
-    for a in links:
-        name = (a.text or "").strip()
-        href = a.get_attribute("href")
-        if name and href and "course/view.php?id=" in href:
-            courses.append((name, href))
+    # 2) Fallback: parse current HTML directly (some themes render links outside expected selectors)
+    html = driver.page_source or ""
+    courses = _unique_courses(_extract_course_links_from_html(html))
+    if courses:
+        return courses
 
-    uniq: list[tuple[str, str]] = []
-    seen = set()
-    for n, u in courses:
-        if u not in seen:
-            uniq.append((n, u))
-            seen.add(u)
-    return uniq
+    # 3) Last resort: try additional Moodle entry points after successful SSO
+    for url in ("https://moodle.tau.ac.il/my/", "https://moodle.tau.ac.il/my/courses.php"):
+        try:
+            driver.get(url)
+            WebDriverWait(driver, WAIT_SEC).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            courses = _courses_from_current_dom(driver)
+            if courses:
+                return courses
+            courses = _unique_courses(_extract_course_links_from_html(driver.page_source or ""))
+            if courses:
+                return courses
+        except Exception:
+            continue
+
+    raise RuntimeError(f"No courses found after login. final_url={driver.current_url}")
 
 
 # ==========================
