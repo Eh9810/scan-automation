@@ -13,7 +13,7 @@ TAU Moodle scanner (GitHub Actions-ready):
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 import json
 import logging
 import os
@@ -51,6 +51,7 @@ class MoodleMaintenanceError(Exception):
 
 LOGIN_URL = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential&sid=0"
 MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
+MOODLE_DASHBOARD_URL = "https://moodle.tau.ac.il/my/"
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
 WAIT_SEC = 30
@@ -148,6 +149,133 @@ def _session_from_selenium_cookies(driver: webdriver.Chrome) -> requests.Session
     return s
 
 
+# ==========================
+# HTTP-BASED SAML LOGIN (no Selenium)
+# ==========================
+
+# Known NIDP form-field names for each credential type
+_NIDP_USER_NAMES = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
+_NIDP_PID_NAMES = ["Ecom_Taz", "Ecom_User_Pid", "Ecom_Pid", "pid", "tz"]
+_NIDP_PASS_NAMES = ["Ecom_Password", "Ecom_Pass", "password", "pass"]
+
+
+def _fill_nidp_credentials(form_data: dict) -> None:
+    """Inject TAU credentials into an HTML-form data dict (in-place)."""
+    for key in _NIDP_USER_NAMES:
+        if key in form_data:
+            form_data[key] = USERNAME
+            break
+    for key in _NIDP_PID_NAMES:
+        if key in form_data:
+            form_data[key] = USER_ID
+            break
+    for key in _NIDP_PASS_NAMES:
+        if key in form_data:
+            form_data[key] = PASSWORD
+            break
+
+
+def _form_to_dict(form, base_url: str) -> tuple:
+    """
+    Extract (action_url, {name: value}) from a BeautifulSoup <form> element.
+    Resolves relative action URLs against base_url.
+    """
+    action = form.get("action") or base_url
+    if not action.startswith("http"):
+        action = urljoin(base_url, action)
+    data = {
+        inp["name"]: inp.get("value", "")
+        for inp in form.find_all("input")
+        if inp.get("name")
+    }
+    return action, data
+
+
+def _http_saml_login() -> "requests.Session | None":
+    """
+    Authenticate against TAU NIDP via a plain-HTTP SAML SSO handshake
+    (no browser / no Selenium).
+
+    Steps:
+      1. GET the NIDP SSO URL  → HTML login form
+      2. POST credentials      → NIDP returns auto-submit SAMLResponse form
+      3. POST SAMLResponse     → Moodle ACS sets session cookie + redirects
+      4. Verify we landed on a real, non-maintenance Moodle page
+
+    Returns a requests.Session with valid Moodle cookies on success, or None on
+    any failure so the caller can fall back to Selenium.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+    })
+
+    try:
+        # ── 1. Fetch NIDP login page ──────────────────────────────────────────
+        logger.info("HTTP login step 1: GET %s", LOGIN_URL)
+        resp = session.get(LOGIN_URL, timeout=30)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        form = soup.find("form")
+        if not form:
+            logger.warning("HTTP login: no <form> on NIDP login page – cannot proceed")
+            return None
+
+        action, data = _form_to_dict(form, resp.url)
+        _fill_nidp_credentials(data)
+
+        # ── 2. Submit credentials to NIDP ────────────────────────────────────
+        logger.info("HTTP login step 2: POST credentials to %s", action)
+        resp = session.post(action, data=data, timeout=30)
+        resp.raise_for_status()
+
+        # ── 3. POST SAMLResponse to Moodle ACS ───────────────────────────────
+        soup = BeautifulSoup(resp.text, "html.parser")
+        saml_input = soup.find("input", {"name": "SAMLResponse"})
+        if not saml_input:
+            title = soup.find("title")
+            logger.warning(
+                "HTTP login: no SAMLResponse in NIDP response "
+                "(wrong credentials or JS-only flow). Page title: %r",
+                title.get_text() if title else "",
+            )
+            return None
+
+        saml_form = saml_input.find_parent("form")
+        acs_url, saml_data = _form_to_dict(saml_form, resp.url)
+        logger.info("HTTP login step 3: POST SAMLResponse to Moodle ACS %s", acs_url)
+        resp = session.post(acs_url, data=saml_data, timeout=30)
+        resp.raise_for_status()
+
+        # ── 4. Verify Moodle landing page ────────────────────────────────────
+        if "moodle.tau.ac.il" not in resp.url:
+            logger.warning("HTTP login: unexpected landing URL: %s", resp.url)
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title_el = soup.find("title")
+        title_text = title_el.get_text() if title_el else ""
+        if "mainten" in title_text.lower():
+            logger.warning(
+                "HTTP login: maintenance page on landing URL %s (title=%r)",
+                resp.url, title_text,
+            )
+            return None
+
+        logger.info("HTTP login succeeded – landed on %s (title=%r)", resp.url, title_text)
+        return session
+
+    except Exception as exc:
+        logger.warning("HTTP login failed: %s", exc)
+        return None
+
+
 def _http_head_follow(session: requests.Session, url: str) -> requests.Response | None:
     try:
         r = session.head(url, allow_redirects=True, timeout=30)
@@ -166,6 +294,49 @@ def _http_get_html(session: requests.Session, url: str) -> str | None:
         return r.text
     except Exception:
         return None
+
+
+def _get_courses_via_http(session: requests.Session) -> list:
+    """
+    Fetch the enrolled-course list using a plain-HTTP session (no Selenium).
+
+    Tries MY_COURSES_URL first, then MOODLE_DASHBOARD_URL as a fallback.
+    Returns a de-duplicated list of (raw_course_name, course_url) tuples.
+    """
+    for url in (MY_COURSES_URL, MOODLE_DASHBOARD_URL):
+        html = _http_get_html(session, url)
+        if not html:
+            logger.warning("HTTP courses: could not fetch %s", url)
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        title_el = soup.find("title")
+        title_text = (title_el.get_text() if title_el else "").lower()
+        if "mainten" in title_text:
+            logger.warning(
+                "HTTP courses: maintenance page at %s (title=%r) – trying fallback",
+                url, title_text,
+            )
+            continue
+
+        courses: list = []
+        seen: set = set()
+        for a in soup.find_all("a", href=True):
+            href: str = a["href"]
+            if "course/view.php?id=" not in href:
+                continue
+            name = a.get_text(strip=True)
+            if name and href not in seen:
+                courses.append((name, href))
+                seen.add(href)
+
+        if courses:
+            logger.info("HTTP courses: found %d unique courses at %s", len(courses), url)
+            return courses
+
+        logger.warning("HTTP courses: no courses found at %s – trying fallback", url)
+
+    return []
 
 
 def _extract_pluginfile_links_from_html(html: str) -> list[tuple[str, str]]:
@@ -539,8 +710,25 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     time.sleep(1.5)
 
     if _is_maintenance_page(driver):
-        raise MoodleMaintenanceError(
-            f"maintenance page detected (url={driver.current_url!r}, title={driver.title!r})"
+        # MY_COURSES_URL shows a maintenance page – verify whether this is a
+        # URL-specific issue (plugin down) or genuine site-wide maintenance by
+        # checking the main dashboard before giving up.
+        logger.warning(
+            "Maintenance page on MyCourses (url=%s, title=%r) – "
+            "verifying via dashboard %s",
+            driver.current_url, driver.title, MOODLE_DASHBOARD_URL,
+        )
+        driver.get(MOODLE_DASHBOARD_URL)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(1.5)
+        if _is_maintenance_page(driver):
+            raise MoodleMaintenanceError(
+                f"maintenance page detected on url={driver.current_url!r}, title={driver.title!r}"
+            )
+        logger.info(
+            "Dashboard accessible (url=%s) – "
+            "MyCourses plugin unavailable but Moodle is up; continuing from dashboard",
+            driver.current_url,
         )
 
     if click_login_if_guest(driver):
@@ -725,6 +913,27 @@ def main():
     run_start = datetime.now(TZ_IL)
     last_run = load_last_run()
 
+    # ── Attempt 1: HTTP-based SAML login (no Selenium; avoids headless-Chrome bot detection) ──
+    logger.info("Attempting HTTP-based SAML login (no browser)…")
+    http_session = _http_saml_login()
+    if http_session is not None:
+        courses = _get_courses_via_http(http_session)
+        if courses:
+            logger.info("HTTP mode: found %d courses – running scan", len(courses))
+            print(f"\nFound {len(courses)} courses (HTTP mode).\n")
+            results = scan_all(http_session, courses, last_run)
+            save_last_run(run_start)
+            if not results:
+                print("No updates since last run. (No Telegram message will be sent.)")
+                return
+            lines = [_format_line(x) for x in results]
+            header = f"📌 עדכונים במודל מאז {last_run.strftime('%d.%m.%Y %H:%M')} ({len(lines)}):"
+            telegram_send_many(lines, header)
+            return
+        logger.warning("HTTP mode: login succeeded but no courses found – falling back to Selenium")
+
+    # ── Attempt 2: Fall back to Selenium browser login ──
+    logger.info("Falling back to Selenium browser login…")
     driver = build_driver()
     try:
         driver.get(LOGIN_URL)
