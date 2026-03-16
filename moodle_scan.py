@@ -57,6 +57,7 @@ WAIT_SEC = 30
 HEADLESS = True
 
 STATE_FILE = "last_run.json"  # will be created/updated in repo
+MAINTENANCE_NOTIFY_THROTTLE_HOURS = 4  # send at most one maintenance alert per this many hours
 
 logger = logging.getLogger(__name__)
 
@@ -252,31 +253,56 @@ def _format_line(item: FoundFile) -> str:
 # STATE (last run)
 # ==========================
 
-def load_last_run() -> datetime:
-    # default: last hour (so first run won't spam months)
-    fallback = datetime.now(TZ_IL) - timedelta(hours=1)
-
+def _load_state_data() -> dict:
+    """Read the raw JSON state dict (returns {} if missing or unreadable)."""
     if not os.path.exists(STATE_FILE):
-        return fallback
-
+        return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        iso = data.get("last_run_iso")
-        if not iso:
-            return fallback
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _parse_state_dt(iso: str | None) -> datetime | None:
+    """Parse an ISO datetime string from the state file; return None on failure."""
+    if not iso:
+        return None
+    try:
         dt = datetime.fromisoformat(iso)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=TZ_IL)
         return dt.astimezone(TZ_IL)
     except Exception:
-        return fallback
+        return None
+
+
+def load_last_run() -> datetime:
+    # default: last hour (so first run won't spam months)
+    fallback = datetime.now(TZ_IL) - timedelta(hours=1)
+    dt = _parse_state_dt(_load_state_data().get("last_run_iso"))
+    return dt if dt is not None else fallback
+
+
+def load_last_maintenance_notified() -> datetime | None:
+    """Return when we last sent a maintenance notification, or None if never."""
+    return _parse_state_dt(_load_state_data().get("last_maintenance_notified_iso"))
+
+
+def _save_state(updates: dict) -> None:
+    """Merge *updates* into the existing state file and write it back."""
+    data = _load_state_data()
+    data.update(updates)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def save_last_run(run_start: datetime) -> None:
-    data = {"last_run_iso": run_start.astimezone(TZ_IL).isoformat()}
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    _save_state({"last_run_iso": run_start.astimezone(TZ_IL).isoformat()})
+
+
+def save_maintenance_notified(dt: datetime) -> None:
+    _save_state({"last_maintenance_notified_iso": dt.astimezone(TZ_IL).isoformat()})
 
 
 # ==========================
@@ -731,7 +757,20 @@ if __name__ == "__main__":
         main()
     except MoodleMaintenanceError as e:
         logger.warning("Moodle is under maintenance – skipping this run. (%s)", e)
-        # Exit cleanly (no Telegram error, no non-zero exit code)
+        # Notify via Telegram at most once per MAINTENANCE_NOTIFY_THROTTLE_HOURS hours
+        # so the user knows why no new-file notification arrived.
+        now = datetime.now(TZ_IL)
+        last_notified = load_last_maintenance_notified()
+        throttle_sec = MAINTENANCE_NOTIFY_THROTTLE_HOURS * 3600
+        if last_notified is None or (now - last_notified).total_seconds() >= throttle_sec:
+            last_run = load_last_run()
+            maint_msg = (
+                f"⚠️ מודל בתחזוקה – סריקה דולגה\n"
+                f"הסריקה הבאה תבדוק קבצים מאז "
+                f"{last_run.strftime('%d.%m.%Y %H:%M')}"
+            )
+            telegram_send(maint_msg)
+            save_maintenance_notified(now)
     except Exception as e:
         # send error to Telegram (very important)
         run_link = github_run_url()
