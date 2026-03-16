@@ -470,6 +470,36 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
     return False
 
 
+def _is_guest_page(driver: webdriver.Chrome) -> bool:
+    guest_indicators = [
+        "//*[contains(., 'גישת אורחים')]",
+        "//*[contains(., 'Guest access')]",
+        "//*[contains(., 'You are currently using guest access')]",
+    ]
+    for xp in guest_indicators:
+        try:
+            if driver.find_elements(By.XPATH, xp):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _has_login_link(driver: webdriver.Chrome) -> bool:
+    checks = [
+        "//a[contains(@href, '/login/index.php')]",
+        "//a[contains(@href, 'nidp.tau.ac.il')]",
+        "//button[@data-action='login']",
+    ]
+    for xp in checks:
+        try:
+            if driver.find_elements(By.XPATH, xp):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _find_course_links(driver: webdriver.Chrome):
     """Support multiple MyCourses DOM variants (class names changed over time)."""
     selectors = [
@@ -494,32 +524,52 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     If guest access -> click login -> complete SSO -> back to MyCourses.
     """
     wait = WebDriverWait(driver, WAIT_SEC)
-    driver.get(MY_COURSES_URL)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(0.8)
+    for attempt in range(1, 4):
+        driver.get(MY_COURSES_URL)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(0.8)
 
-    if click_login_if_guest(driver):
-        time.sleep(1.2)
+        clicked_login = click_login_if_guest(driver)
+        if clicked_login:
+            print(f"[login] attempt {attempt}: clicked login link/button")
+            time.sleep(1.2)
 
         if "nidp.tau.ac.il" in driver.current_url.lower():
+            print(f"[login] attempt {attempt}: on NIDP, trying form fill")
             maybe_login_nidp(driver)
             ensure_on_moodle(driver)
+            driver.get(MY_COURSES_URL)
 
-        driver.get(MY_COURSES_URL)
+        # success condition: we actually got course links
+        if _find_course_links(driver):
+            return
+
+        # if page still looks like guest/login, retry a fresh cycle
+        if _is_guest_page(driver) or _has_login_link(driver):
+            print(f"[login] attempt {attempt}: still guest/login page, retrying")
+            continue
+
+        # unknown state: break and let detailed error below describe it
+        break
 
     def courses_or_guest(d):
         if _find_course_links(d):
             return True
-        if d.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
+        if _is_guest_page(d):
             return True
-        if d.find_elements(By.XPATH, "//a[contains(@href, '/login/index.php')]"):
+        if _has_login_link(d):
             return True
         return False
 
     wait.until(courses_or_guest)
 
-    if driver.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
-        raise RuntimeError("Still guest access on MyCourses; SSO did not complete automatically.")
+    if _is_guest_page(driver) or _has_login_link(driver):
+        page_excerpt = (driver.page_source or "")[:2000]
+        raise RuntimeError(
+            "Still not logged in on MyCourses after retries. "
+            f"url={driver.current_url}\n"
+            f"page_excerpt={page_excerpt}"
+        )
 
 
 def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
