@@ -190,6 +190,21 @@ def _extract_activity_links_from_course_html(html: str) -> tuple[set[str], set[s
     return pluginfiles, activity_pages
 
 
+def _extract_course_links_from_html(html: str) -> list[tuple[str, str]]:
+    """Parse course links from any Moodle page HTML variant."""
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[tuple[str, str]] = []
+    for a in soup.select("a[href*='course/view.php?id=']"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        text = (a.get_text(" ", strip=True) or "").strip()
+        if not text:
+            text = href
+        out.append((text, href))
+    return out
+
+
 def _resolve_resource_view_to_file(session: requests.Session, view_url: str) -> list[str]:
     urls: list[str] = []
 
@@ -518,6 +533,31 @@ def _find_course_links(driver: webdriver.Chrome):
     return links
 
 
+def _unique_courses(courses: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    uniq: list[tuple[str, str]] = []
+    seen = set()
+    for n, u in courses:
+        if not u or "course/view.php?id=" not in u:
+            continue
+        if u in seen:
+            continue
+        uniq.append((n.strip() or u, u))
+        seen.add(u)
+    return uniq
+
+
+def _courses_from_current_dom(driver: webdriver.Chrome) -> list[tuple[str, str]]:
+    courses: list[tuple[str, str]] = []
+    for a in _find_course_links(driver):
+        try:
+            name = (a.text or "").strip()
+            href = a.get_attribute("href")
+            courses.append((name, href))
+        except Exception:
+            continue
+    return _unique_courses(courses)
+
+
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     """
     Go to MyCourses.
@@ -575,24 +615,32 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
 def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     ensure_logged_in_moodle(driver)
 
-    wait = WebDriverWait(driver, WAIT_SEC)
-    wait.until(lambda d: len(_find_course_links(d)) > 0)
+    # 1) Fast path: links in current DOM
+    courses = _courses_from_current_dom(driver)
+    if courses:
+        return courses
 
-    links = _find_course_links(driver)
-    courses: list[tuple[str, str]] = []
-    for a in links:
-        name = (a.text or "").strip()
-        href = a.get_attribute("href")
-        if name and href and "course/view.php?id=" in href:
-            courses.append((name, href))
+    # 2) Fallback: parse current HTML directly (some themes render links outside expected selectors)
+    html = driver.page_source or ""
+    courses = _unique_courses(_extract_course_links_from_html(html))
+    if courses:
+        return courses
 
-    uniq: list[tuple[str, str]] = []
-    seen = set()
-    for n, u in courses:
-        if u not in seen:
-            uniq.append((n, u))
-            seen.add(u)
-    return uniq
+    # 3) Last resort: try additional Moodle entry points after successful SSO
+    for url in ("https://moodle.tau.ac.il/my/", "https://moodle.tau.ac.il/my/courses.php"):
+        try:
+            driver.get(url)
+            WebDriverWait(driver, WAIT_SEC).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            courses = _courses_from_current_dom(driver)
+            if courses:
+                return courses
+            courses = _unique_courses(_extract_course_links_from_html(driver.page_source or ""))
+            if courses:
+                return courses
+        except Exception:
+            continue
+
+    raise RuntimeError(f"No courses found after login. final_url={driver.current_url}")
 
 
 # ==========================
