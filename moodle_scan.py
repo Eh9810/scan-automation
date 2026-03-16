@@ -74,6 +74,9 @@ PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# Set by GitHub Actions; "workflow_dispatch" means the user triggered the run manually.
+GITHUB_EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "")
+
 
 # ==========================
 # DATA
@@ -757,12 +760,15 @@ if __name__ == "__main__":
         main()
     except MoodleMaintenanceError as e:
         logger.warning("Moodle is under maintenance – skipping this run. (%s)", e)
-        # Notify via Telegram at most once per MAINTENANCE_NOTIFY_THROTTLE_HOURS hours
-        # so the user knows why no new-file notification arrived.
+        # Notify via Telegram.
+        # For manual (workflow_dispatch) runs: always notify so the user gets immediate feedback.
+        # For scheduled runs: throttle to at most once per MAINTENANCE_NOTIFY_THROTTLE_HOURS hours
+        # to avoid spamming during prolonged maintenance windows.
         now = datetime.now(TZ_IL)
         last_notified = load_last_maintenance_notified()
         throttle_sec = MAINTENANCE_NOTIFY_THROTTLE_HOURS * 3600
-        if last_notified is None or (now - last_notified).total_seconds() >= throttle_sec:
+        is_manual = GITHUB_EVENT_NAME == "workflow_dispatch"
+        if is_manual or last_notified is None or (now - last_notified).total_seconds() >= throttle_sec:
             last_run = load_last_run()
             maint_msg = (
                 f"⚠️ מודל בתחזוקה – סריקה דולגה\n"
