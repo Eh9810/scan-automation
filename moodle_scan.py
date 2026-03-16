@@ -58,6 +58,8 @@ HEADLESS = True
 
 STATE_FILE = "last_run.json"  # will be created/updated in repo
 MAINTENANCE_NOTIFY_THROTTLE_HOURS = 4  # send at most one maintenance alert per this many hours
+MAINTENANCE_RETRY_COUNT = 2      # retry this many extra times before giving up on maintenance
+MAINTENANCE_RETRY_DELAY_SEC = 60  # seconds to wait between maintenance retries
 
 logger = logging.getLogger(__name__)
 
@@ -538,7 +540,7 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
 
     if _is_maintenance_page(driver):
         raise MoodleMaintenanceError(
-            f"Moodle is under maintenance (page title: '{driver.title}')"
+            f"maintenance page detected (url={driver.current_url!r}, title={driver.title!r})"
         )
 
     if click_login_if_guest(driver):
@@ -556,7 +558,7 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
 
         if _is_maintenance_page(driver):
             raise MoodleMaintenanceError(
-                f"Moodle is under maintenance (page title: '{driver.title}')"
+                f"maintenance page detected (url={driver.current_url!r}, title={driver.title!r})"
             )
 
     try:
@@ -565,7 +567,7 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
     except TimeoutException:
         if _is_maintenance_page(driver):
             raise MoodleMaintenanceError(
-                f"Moodle is under maintenance (page title: '{driver.title}')"
+                f"maintenance page detected (url={driver.current_url!r}, title={driver.title!r})"
             )
         logger.warning(
             "Timeout waiting for courses (url=%s) – refreshing page and retrying",
@@ -576,7 +578,7 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         time.sleep(1.5)
         if _is_maintenance_page(driver):
             raise MoodleMaintenanceError(
-                f"Moodle is under maintenance (page title: '{driver.title}')"
+                f"maintenance page detected (url={driver.current_url!r}, title={driver.title!r})"
             )
         try:
             wait.until(_courses_detected)
@@ -756,40 +758,54 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except MoodleMaintenanceError as e:
-        logger.warning("Moodle is under maintenance – skipping this run. (%s)", e)
-        # Notify via Telegram.
-        # For manual (workflow_dispatch) runs: always notify so the user gets immediate feedback.
-        # For scheduled runs: throttle to at most once per MAINTENANCE_NOTIFY_THROTTLE_HOURS hours
-        # to avoid spamming during prolonged maintenance windows.
-        now = datetime.now(TZ_IL)
-        last_notified = load_last_maintenance_notified()
-        throttle_sec = MAINTENANCE_NOTIFY_THROTTLE_HOURS * 3600
-        is_manual = GITHUB_EVENT_NAME == "workflow_dispatch"
-        if is_manual or last_notified is None or (now - last_notified).total_seconds() >= throttle_sec:
-            last_run = load_last_run()
-            maint_msg = (
-                f"⚠️ מודל בתחזוקה – סריקה דולגה\n"
-                f"הסריקה הבאה תבדוק קבצים מאז "
-                f"{last_run.strftime('%d.%m.%Y %H:%M')}"
+    for attempt in range(1, MAINTENANCE_RETRY_COUNT + 2):  # attempts: 1 … MAINTENANCE_RETRY_COUNT+1
+        try:
+            main()
+            break  # success – exit retry loop
+        except MoodleMaintenanceError as e:
+            if attempt <= MAINTENANCE_RETRY_COUNT:
+                logger.warning(
+                    "Maintenance page on attempt %d/%d – retrying in %ds. (%s)",
+                    attempt, MAINTENANCE_RETRY_COUNT + 1, MAINTENANCE_RETRY_DELAY_SEC, e,
+                )
+                time.sleep(MAINTENANCE_RETRY_DELAY_SEC)
+                continue
+
+            # All retries exhausted – log and notify once (subject to throttle).
+            logger.warning(
+                "Moodle maintenance confirmed after %d attempt(s) – skipping this run. (%s)",
+                attempt, e,
             )
-            telegram_send(maint_msg)
-            save_maintenance_notified(now)
-    except Exception as e:
-        # send error to Telegram (very important)
-        run_link = github_run_url()
-        tb = traceback.format_exc()
+            # For manual (workflow_dispatch) runs: always notify so the user gets immediate feedback.
+            # For scheduled runs: throttle to at most once per MAINTENANCE_NOTIFY_THROTTLE_HOURS hours
+            # to avoid spamming during prolonged maintenance windows.
+            now = datetime.now(TZ_IL)
+            last_notified = load_last_maintenance_notified()
+            throttle_sec = MAINTENANCE_NOTIFY_THROTTLE_HOURS * 3600
+            is_manual = GITHUB_EVENT_NAME == "workflow_dispatch"
+            if is_manual or last_notified is None or (now - last_notified).total_seconds() >= throttle_sec:
+                last_run = load_last_run()
+                maint_msg = (
+                    f"⚠️ מודל בתחזוקה – סריקה דולגה\n"
+                    f"פרטים: {e}\n"
+                    f"הסריקה הבאה תבדוק קבצים מאז "
+                    f"{last_run.strftime('%d.%m.%Y %H:%M')}"
+                )
+                telegram_send(maint_msg)
+                save_maintenance_notified(now)
+        except Exception as e:
+            # send error to Telegram (very important)
+            run_link = github_run_url()
+            tb = traceback.format_exc()
 
-        msg = "❌ Moodle scan failed (Exception)\n"
-        if run_link:
-            msg += f"🔗 Logs: {run_link}\n\n"
-        msg += tb
+            msg = "❌ Moodle scan failed (Exception)\n"
+            if run_link:
+                msg += f"🔗 Logs: {run_link}\n\n"
+            msg += tb
 
-        # Telegram has length limits; clip a bit
-        if len(msg) > 3800:
-            msg = msg[:3800] + "\n...\n(Traceback clipped)"
+            # Telegram has length limits; clip a bit
+            if len(msg) > 3800:
+                msg = msg[:3800] + "\n...\n(Traceback clipped)"
 
-        telegram_send(msg)
-        raise
+            telegram_send(msg)
+            raise
