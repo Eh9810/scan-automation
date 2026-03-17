@@ -51,7 +51,7 @@ MOODLE_SAML_LOGIN_URL = "https://moodle.tau.ac.il/auth/saml2/login.php"
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
 WAIT_SEC = 30
-HEADLESS = os.environ.get("MOODLE_HEADLESS", "true").strip().lower() in ("1", "true", "yes", "on")  # keep configurable; do not hardcode False
+HEADLESS = os.environ.get("MOODLE_HEADLESS", "true").strip().lower() in ("1", "true", "yes", "on")
 
 STATE_FILE = "last_run.json"  # will be created/updated in repo
 LOGIN_DEBUG_HTML = "login_debug_page.html"
