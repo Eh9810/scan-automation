@@ -37,7 +37,7 @@ from selenium.webdriver.chrome.options import Options
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
 BASE_URL = "https://moodle.tau.ac.il/local/mycourses/"
-OUT_ROOT = Path("forensics_output")
+OUT_ROOT = Path(r"C:\Users\edeni\OneDrive\PythonStudies\python uses\extract_files_from_moodle\understanding how moodle security works\results") / "CODEX"
 
 
 @dataclass
