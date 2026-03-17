@@ -42,7 +42,117 @@ except ImportError:
 
 
 class MoodleMaintenanceError(Exception):
-    """Raised when Moodle is showing a maintenance page."""
+    """Raised when Moodle is showing a maintenance or WAF-block page."""
+
+
+# ── WAF / IP-block detection ─────────────────────────────────────────────────
+# TAU Moodle is protected by an F5 BIG-IP Advanced WAF.  When a GitHub-hosted
+# runner IP is blocked the server returns HTTP 200 with a custom HTML page:
+#   • title: "TAU Under Maintenence"  (intentional misspelling on the TAU page)
+#   • body:  "Your support ID is: <UUID>"  (F5 BIG-IP ASM / Advanced WAF)
+#   • text:  "Access denied." / "בקשה נדחתה."
+# This is NOT genuine Moodle maintenance – it is an active IP-reputation block
+# by the F5 WAF.  Detecting the pattern lets us give a clearer Telegram alert.
+_F5_SUPPORT_UUID_RE = re.compile(
+    r"Your support ID is:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+    r"-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+_ACCESS_DENIED_TEXTS = ("access denied", "בקשה נדחתה")
+
+
+def _detect_block_type(html: str) -> str:
+    """
+    Analyse the HTML of a potentially-blocked page and return a short
+    diagnostic string suitable for log messages and Telegram alerts.
+
+    Return values:
+      ``"f5_waf_ip_block"``  – F5 BIG-IP ASM/WAF blocked the request by IP
+      ``"access_denied"``    – Generic access-denied page (WAF type unknown)
+      ``"maintenance"``      – Moodle's own maintenance mode page
+      ``"ok"``               – No block detected
+    """
+    if _F5_SUPPORT_UUID_RE.search(html):
+        return "f5_waf_ip_block"
+    lower = html.lower()
+    if any(p in lower for p in _ACCESS_DENIED_TEXTS):
+        return "access_denied"
+    if "mainten" in lower:
+        return "maintenance"
+    return "ok"
+
+
+def _extract_f5_support_uuid(html: str) -> str:
+    """Return the F5 support UUID embedded in a WAF block page, or ''."""
+    m = _F5_SUPPORT_UUID_RE.search(html)
+    return m.group(1) if m else ""
+
+
+def _preflight_check() -> dict:
+    """
+    Make a lightweight HTTP GET to the Moodle homepage and return a diagnostic
+    dictionary that describes what kind of security/WAF response we receive.
+
+    This runs before any login attempt so failures are diagnosed immediately
+    rather than after a full Selenium/SAML round-trip.
+
+    Returned keys
+    -------------
+    status_code  : int   HTTP status code (0 on connection error)
+    accessible   : bool  True when the response looks like normal Moodle
+    block_type   : str   see _detect_block_type()
+    server       : str   value of the Server response header
+    waf_hints    : list  detected WAF/security indicators from headers
+    support_uuid : str   F5 BIG-IP support UUID if present, else ""
+    """
+    result: dict = {
+        "status_code": 0,
+        "accessible": False,
+        "block_type": "unknown",
+        "server": "",
+        "waf_hints": [],
+        "support_uuid": "",
+    }
+    try:
+        r = requests.get(
+            MY_COURSES_URL,
+            headers={
+                "User-Agent": _BROWSER_UA,
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+            timeout=20,
+            allow_redirects=True,
+        )
+        result["status_code"] = r.status_code
+        result["server"] = r.headers.get("Server", "")
+
+        hints: list[str] = []
+        h = {k.lower(): v for k, v in r.headers.items()}
+        # F5 BIG-IP may add proprietary X-F5-* headers.
+        if any(k.startswith("x-f5") for k in h):
+            hints.append("F5 indicator in response headers")
+        if "cf-ray" in h:
+            hints.append(f"Cloudflare (cf-ray: {h['cf-ray']})")
+        if "x-waf-event-info" in h:
+            hints.append(f"WAF event info: {h['x-waf-event-info']}")
+        if "server" in h:
+            hints.append(f"Server: {h['server']}")
+
+        html = r.text
+        uuid = _extract_f5_support_uuid(html)
+        if uuid:
+            hints.append(f"F5 BIG-IP support UUID: {uuid}")
+            result["support_uuid"] = uuid
+
+        result["waf_hints"] = hints
+        result["block_type"] = _detect_block_type(html)
+        result["accessible"] = result["block_type"] == "ok"
+    except Exception as exc:
+        result["block_type"] = f"error: {exc}"
+        logger.warning("Preflight check error: %s", exc)
+
+    return result
 
 
 # ==========================
@@ -247,9 +357,14 @@ def _http_saml_login() -> "requests.Session | None":
 
         # If Moodle itself is blocked/under maintenance, surface it immediately.
         if "mainten" in title_text.lower():
+            block_type = _detect_block_type(resp.text)
+            support_uuid = _extract_f5_support_uuid(resp.text)
             raise MoodleMaintenanceError(
-                f"Moodle SAML endpoint shows maintenance page "
-                f"(url={resp.url!r}, title={title_text!r})"
+                f"Moodle SAML endpoint shows maintenance/block page "
+                f"(url={resp.url!r}, title={title_text!r}, "
+                f"block_type={block_type!r}"
+                + (f", support_uuid={support_uuid!r}" if support_uuid else "")
+                + ")"
             )
 
         # If we were already authenticated (no redirect to NIDP), we're done.
@@ -329,9 +444,13 @@ def _http_saml_login() -> "requests.Session | None":
         title_text = title_el.get_text() if title_el else ""
         # "mainten" matches both the correct spelling and the TAU server's misspelling "Maintenence"
         if "mainten" in title_text.lower():
+            block_type = _detect_block_type(resp.text)
+            support_uuid = _extract_f5_support_uuid(resp.text)
             logger.warning(
-                "HTTP login: maintenance page on landing URL %s (title=%r)",
-                resp.url, title_text,
+                "HTTP login: maintenance/block page on landing URL %s "
+                "(title=%r, block_type=%r%s)",
+                resp.url, title_text, block_type,
+                f", support_uuid={support_uuid!r}" if support_uuid else "",
             )
             return None
 
@@ -706,7 +825,13 @@ def load_http_session_from_cookies() -> "requests.Session | None":
     title_text = (title_el.get_text() if title_el else "").lower()
 
     if "mainten" in title_text:
-        logger.warning("Cookie reuse: maintenance page (title=%r)", title_text)
+        block_type = _detect_block_type(html)
+        support_uuid = _extract_f5_support_uuid(html)
+        logger.warning(
+            "Cookie reuse: maintenance/block page (title=%r, block_type=%r%s)",
+            title_text, block_type,
+            f", support_uuid={support_uuid!r}" if support_uuid else "",
+        )
         return None
     if "log in" in title_text or "login" in title_text or "sign in" in title_text:
         logger.warning("Cookie reuse: redirected to login – cookies expired (title=%r)", title_text)
@@ -921,13 +1046,33 @@ _GUEST_XPATH = "//*[contains(., 'גישת אורחים')]"
 
 
 def _is_maintenance_page(driver: webdriver.Chrome) -> bool:
-    """Return True if the current page appears to be a Moodle maintenance page.
+    """Return True if the current page appears to be a Moodle maintenance or
+    WAF IP-block page.
 
-    The actual page title uses the misspelling "Maintenence", so we match on
-    the common prefix "mainten" to catch all spelling variants.
+    The TAU WAF block page title uses the misspelling "Maintenence"; real Moodle
+    maintenance mode also contains "mainten".  Both cases prevent us from
+    proceeding, so we raise MoodleMaintenanceError for both.  The block_type
+    helper in the exception message distinguishes the two when it matters.
     """
     title = (driver.title or "").lower()
     return "mainten" in title
+
+
+def _maintenance_error_from_driver(driver: webdriver.Chrome) -> "MoodleMaintenanceError":
+    """Build a MoodleMaintenanceError that includes WAF-block diagnostics."""
+    try:
+        html = driver.page_source or ""
+    except Exception:
+        html = ""
+    block_type = _detect_block_type(html)
+    support_uuid = _extract_f5_support_uuid(html)
+    return MoodleMaintenanceError(
+        f"maintenance/block page detected "
+        f"(url={driver.current_url!r}, title={driver.title!r}, "
+        f"block_type={block_type!r}"
+        + (f", support_uuid={support_uuid!r}" if support_uuid else "")
+        + ")"
+    )
 
 
 def _courses_detected(d) -> bool:
@@ -971,7 +1116,7 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         # URL-specific issue (plugin down) or genuine site-wide maintenance by
         # checking the main dashboard before giving up.
         logger.warning(
-            "Maintenance page on MyCourses (url=%s, title=%r) – "
+            "Maintenance/block page on MyCourses (url=%s, title=%r) – "
             "verifying via dashboard %s",
             driver.current_url, driver.title, MOODLE_DASHBOARD_URL,
         )
@@ -979,9 +1124,7 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(1.5)
         if _is_maintenance_page(driver):
-            raise MoodleMaintenanceError(
-                f"maintenance page detected on url={driver.current_url!r}, title={driver.title!r}"
-            )
+            raise _maintenance_error_from_driver(driver)
         logger.info(
             "Dashboard accessible (url=%s) – "
             "MyCourses plugin unavailable but Moodle is up; continuing from dashboard",
@@ -1012,18 +1155,14 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
         if _is_maintenance_page(driver):
-            raise MoodleMaintenanceError(
-                f"maintenance page detected (url={driver.current_url!r}, title={driver.title!r})"
-            )
+            raise _maintenance_error_from_driver(driver)
 
     try:
         wait.until(_courses_detected)
         logger.info("Course list detected on first attempt")
     except TimeoutException:
         if _is_maintenance_page(driver):
-            raise MoodleMaintenanceError(
-                f"maintenance page detected (url={driver.current_url!r}, title={driver.title!r})"
-            )
+            raise _maintenance_error_from_driver(driver)
         logger.warning(
             "Timeout waiting for courses (url=%s) – refreshing page and retrying",
             driver.current_url,
@@ -1032,9 +1171,7 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(1.5)
         if _is_maintenance_page(driver):
-            raise MoodleMaintenanceError(
-                f"maintenance page detected (url={driver.current_url!r}, title={driver.title!r})"
-            )
+            raise _maintenance_error_from_driver(driver)
         try:
             wait.until(_courses_detected)
             logger.info("Course list detected after page refresh")
@@ -1198,6 +1335,36 @@ def main():
     run_start = datetime.now(TZ_IL)
     last_run = load_last_run()
 
+    # ── Preflight: diagnose Moodle accessibility before spending time on login ──
+    logger.info("Running preflight connectivity check on %s …", MY_COURSES_URL)
+    diag = _preflight_check()
+    logger.info(
+        "Preflight result: status=%s, accessible=%s, block_type=%r, "
+        "server=%r, waf_hints=%s%s",
+        diag["status_code"], diag["accessible"], diag["block_type"],
+        diag["server"], diag["waf_hints"],
+        f", support_uuid={diag['support_uuid']!r}" if diag["support_uuid"] else "",
+    )
+    if not diag["accessible"]:
+        bt = diag["block_type"]
+        uuid = diag["support_uuid"]
+        if bt == "f5_waf_ip_block":
+            raise MoodleMaintenanceError(
+                f"F5 BIG-IP WAF IP-block on preflight check "
+                f"(url={MY_COURSES_URL!r}, support_uuid={uuid!r})"
+            )
+        if bt == "access_denied":
+            raise MoodleMaintenanceError(
+                f"Access-denied page on preflight check "
+                f"(url={MY_COURSES_URL!r}, block_type={bt!r})"
+            )
+        # block_type == "maintenance" or unknown – fall through and let login
+        # attempts surface the concrete error with more context.
+        logger.warning(
+            "Preflight: Moodle appears unavailable (block_type=%r) – "
+            "attempting login anyway", bt,
+        )
+
     # ── Attempt 0: Reuse saved session cookies (fastest – no login round-trip) ──
     logger.info("Trying to reuse saved Moodle session cookies…")
     http_session = load_http_session_from_cookies()
@@ -1281,7 +1448,7 @@ if __name__ == "__main__":
 
             # All retries exhausted – log and notify once (subject to throttle).
             logger.warning(
-                "Moodle maintenance confirmed after %d attempt(s) – skipping this run. (%s)",
+                "Moodle maintenance/block confirmed after %d attempt(s) – skipping this run. (%s)",
                 attempt, e,
             )
             # For manual (workflow_dispatch) runs: always notify so the user gets immediate feedback.
@@ -1293,12 +1460,23 @@ if __name__ == "__main__":
             is_manual = GITHUB_EVENT_NAME == "workflow_dispatch"
             if is_manual or last_notified is None or (now - last_notified).total_seconds() >= throttle_sec:
                 last_run = load_last_run()
-                maint_msg = (
-                    f"⚠️ מודל בתחזוקה – סריקה דולגה\n"
-                    f"פרטים: {e}\n"
-                    f"הסריקה הבאה תבדוק קבצים מאז "
-                    f"{last_run.strftime('%d.%m.%Y %H:%M')}"
-                )
+                err_str = str(e)
+                # Detect WAF IP-block vs genuine Moodle maintenance from the
+                # exception message so we can send a more accurate notification.
+                if "f5_waf_ip_block" in err_str or "support_uuid" in err_str:
+                    maint_msg = (
+                        f"🚫 גישה לMoodle נחסמה על ידי חומת האש (F5 WAF) – סריקה דולגה\n"
+                        f"פרטים: {err_str}\n"
+                        f"הסריקה הבאה תבדוק קבצים מאז "
+                        f"{last_run.strftime('%d.%m.%Y %H:%M')}"
+                    )
+                else:
+                    maint_msg = (
+                        f"⚠️ מודל בתחזוקה – סריקה דולגה\n"
+                        f"פרטים: {err_str}\n"
+                        f"הסריקה הבאה תבדוק קבצים מאז "
+                        f"{last_run.strftime('%d.%m.%Y %H:%M')}"
+                    )
                 telegram_send(maint_msg)
                 save_maintenance_notified(now)
         except Exception as e:
