@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 TAU Moodle scanner (GitHub Actions-ready):
-- Login to TAU NIDP (SSO) via Selenium headless Chrome
+- Login to TAU NIDP (SSO) via undetected-chromedriver (to bypass F5 WAF)
 - Go to My Courses
 - Scan course pages for pluginfile links + resolve resource/folder/assign
 - Use HTTP Last-Modified as "שינוי אחרון"
@@ -26,9 +26,9 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import undetected_chromedriver as uc
 
 try:
     from bs4 import BeautifulSoup
@@ -406,7 +406,7 @@ def _human_delay(base: float = 0.5, jitter: float = 0.8) -> None:
         time.sleep(base)
 
 def build_driver() -> webdriver.Chrome:
-    options = Options()
+    options = uc.ChromeOptions()
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--no-sandbox")
