@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 TAU Moodle scanner (GitHub Actions-ready):
-- Login to TAU NIDP (SSO) via Selenium headless Chrome
+- Login to TAU NIDP (SSO) via undetected-chromedriver (to bypass F5 WAF)
 - Go to My Courses
 - Scan course pages for pluginfile links + resolve resource/folder/assign
 - Use HTTP Last-Modified as "שינוי אחרון"
@@ -26,9 +26,9 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import undetected_chromedriver as uc
 
 try:
     from bs4 import BeautifulSoup
@@ -173,7 +173,7 @@ MOODLE_MY_COURSES_PAGE_URL = "https://moodle.tau.ac.il/my/courses.php"
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
 WAIT_SEC = 30
-HEADLESS = True
+HEADLESS = False  # Changed to False since we run under Xvfb in GitHub Actions
 
 STATE_FILE = "last_run.json"  # will be created/updated in repo
 COOKIES_FILE = "moodle_cookies.json"  # listed in .gitignore; persisted via actions/cache
