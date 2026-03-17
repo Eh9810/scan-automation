@@ -19,6 +19,7 @@ import os
 import re
 import time
 import traceback
+import subprocess
 
 import requests
 from selenium import webdriver
@@ -324,10 +325,19 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-blink-features=AutomationControlled")
     
-    # חשוב: אנחנו לא משתמשים ב-headless. 
-    # גיטהאב יריץ את זה בתוך Xvfb (מסך וירטואלי) ולכן ה-WAF של F5 
-    # יחשוב שזה מחשב רגיל לחלוטין עם מסך פעיל.
-    driver = uc.Chrome(options=options)
+    # איתור אוטומטי של גרסת הכרום בשרת של גיטהאב למניעת שגיאת חוסר תאימות
+    v_main = 145  
+    try:
+        out = subprocess.check_output(['google-chrome', '--version']).decode('utf-8')
+        match = re.search(r'\d+', out)
+        if match:
+            v_main = int(match.group())
+            print(f"Detected Chrome major version: {v_main}")
+    except Exception as e:
+        print(f"Could not detect Chrome version, defaulting to {v_main}. Error: {e}")
+
+    # הרצה עם الجרסה שאותרה ובלי Headless כדי לא להיתפס ב-WAF
+    driver = uc.Chrome(options=options, version_main=v_main)
     
     driver.set_window_size(1920, 1080)
     driver.implicitly_wait(10)
