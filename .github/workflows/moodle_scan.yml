@@ -11,6 +11,8 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout repo
@@ -26,6 +28,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install selenium requests beautifulsoup4
 
+      - name: Ensure Xvfb is available
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
       - name: Run scanner
         env:
           MOODLE_USERNAME: ${{ secrets.MOODLE_USERNAME }}
@@ -33,8 +40,9 @@ jobs:
           MOODLE_PASSWORD: ${{ secrets.MOODLE_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MOODLE_HEADLESS: "false"
         run: |
-          python moodle_scan.py
+          xvfb-run -a python moodle_scan.py
 
       - name: Upload login debug artifact on failure
         if: failure()
