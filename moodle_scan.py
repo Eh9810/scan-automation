@@ -189,6 +189,9 @@ _BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Default domain used when a cookie dict doesn't carry an explicit domain field.
+_DEFAULT_MOODLE_DOMAIN = "moodle.tau.ac.il"
+
 # ==========================
 # SECRETS (from GitHub Actions)
 # ==========================
@@ -201,8 +204,25 @@ PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# Pre-exported cookies from a local authenticated session (produced by
+# export_cookies.py after running debug_browser_capture.py).
+# Value: compact JSON array – [{"name":…,"value":…,"domain":…,"path":…}, …]
+# These cookies include the F5 BIG-IP TS* trust tokens which bypass the WAF
+# bot-score check that blocks GitHub-hosted runner IPs.
+MOODLE_INJECTED_COOKIES = os.environ.get("MOODLE_INJECTED_COOKIES", "").strip()
+
+# Optional: residential proxy URL for routing Moodle traffic through a
+# non-datacenter IP to lower the F5 WAF bot score.
+# Example: "http://user:pass@proxy.example.com:8080"
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+
 # Set by GitHub Actions; "workflow_dispatch" means the user triggered the run manually.
 GITHUB_EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "")
+
+# Build a proxy dict for requests.Session (empty dict → no proxy).
+_PROXIES: dict[str, str] = (
+    {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else {}
+)
 
 
 # ==========================
@@ -341,6 +361,8 @@ def _http_saml_login() -> "requests.Session | None":
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
     })
+    if _PROXIES:
+        session.proxies.update(_PROXIES)
 
     try:
         # ── 1. Trigger Moodle SP-initiated SAML login ────────────────────────
@@ -805,6 +827,8 @@ def load_http_session_from_cookies() -> "requests.Session | None":
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
     })
+    if _PROXIES:
+        session.proxies.update(_PROXIES)
     for c in saved:
         session.cookies.set(
             name=c["name"],
@@ -841,9 +865,96 @@ def load_http_session_from_cookies() -> "requests.Session | None":
     return session
 
 
-# ==========================
-# TELEGRAM
-# ==========================
+def _load_injected_session() -> "requests.Session | None":
+    """
+    Build a requests.Session from the MOODLE_INJECTED_COOKIES environment variable.
+
+    The variable is set via the GitHub Actions secret ``MOODLE_INJECTED_COOKIES``
+    and produced locally by ``export_cookies.py``.  It contains a compact JSON
+    array of cookie dicts::
+
+        [{"name":"TS0124dc84","value":"...","domain":"moodle.tau.ac.il","path":"/"}, ...]
+
+    The F5 BIG-IP **TS*** cookies in the array are the "smoking gun": they carry
+    the bot-score trust token that the WAF assigned when a real human browser
+    on a residential IP logged in.  Injecting them here makes the WAF treat
+    the GitHub-hosted runner as a continuation of that trusted human session,
+    bypassing the IP-reputation and bot-score blocks.
+
+    Returns a working ``requests.Session`` if the cookies are still valid,
+    or ``None`` if the env var is unset / JSON is invalid / session expired.
+    """
+    if not MOODLE_INJECTED_COOKIES:
+        return None
+
+    try:
+        cookie_list = json.loads(MOODLE_INJECTED_COOKIES)
+    except json.JSONDecodeError as exc:
+        logger.warning("MOODLE_INJECTED_COOKIES: invalid JSON – %s", exc)
+        return None
+
+    if not isinstance(cookie_list, list) or not cookie_list:
+        logger.warning("MOODLE_INJECTED_COOKIES: expected a non-empty JSON array")
+        return None
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+    })
+    if _PROXIES:
+        session.proxies.update(_PROXIES)
+
+    loaded = 0
+    for c in cookie_list:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name") or c.get("Name") or ""
+        value = c.get("value") if c.get("value") is not None else c.get("Value", "")
+        domain = (c.get("domain") or c.get("Domain") or _DEFAULT_MOODLE_DOMAIN).lstrip(".")
+        path = c.get("path") or c.get("Path") or "/"
+        if name:
+            session.cookies.set(name=name, value=str(value), domain=domain, path=path)
+            loaded += 1
+
+    logger.info(
+        "Injected %d cookie(s) from MOODLE_INJECTED_COOKIES (names: %s…)",
+        loaded,
+        [c.get("name", "?") for c in cookie_list if isinstance(c, dict)][:8],
+    )
+
+    # Verify the injected session is still valid.
+    logger.info("Verifying injected cookies against %s", MOODLE_DASHBOARD_URL)
+    html = _http_get_html(session, MOODLE_DASHBOARD_URL)
+    if not html:
+        logger.warning("Injected cookies: Moodle dashboard unreachable")
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    title_el = soup.find("title")
+    title_text = (title_el.get_text() if title_el else "").lower()
+
+    if "mainten" in title_text:
+        block_type = _detect_block_type(html)
+        support_uuid = _extract_f5_support_uuid(html)
+        logger.warning(
+            "Injected cookies: maintenance/block page (title=%r, block_type=%r%s)",
+            title_text, block_type,
+            f", support_uuid={support_uuid!r}" if support_uuid else "",
+        )
+        return None
+    if "log in" in title_text or "login" in title_text or "sign in" in title_text:
+        logger.warning(
+            "Injected cookies: session expired or invalid (redirected to login, title=%r)",
+            title_text,
+        )
+        return None
+
+    logger.info("Injected cookies: session valid (dashboard title=%r)", title_text)
+    return session
+
+
 
 def telegram_send(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -887,6 +998,41 @@ def github_run_url() -> str:
 # ==========================
 
 def build_driver() -> webdriver.Chrome:
+    # ── Option A: undetected_chromedriver (hides Selenium/webdriver fingerprints) ──
+    # Install via:  pip install undetected-chromedriver
+    # Falls back silently to plain Selenium if not installed or if it errors.
+    if PROXY_URL:
+        # undetected_chromedriver does not support per-option proxy well on CI;
+        # skip it when a proxy is configured and let plain Selenium handle it.
+        _try_uc = False
+    else:
+        _try_uc = True
+
+    if _try_uc:
+        try:
+            import undetected_chromedriver as uc  # type: ignore[import]
+            uc_opts = uc.ChromeOptions()
+            uc_opts.add_argument("--no-sandbox")
+            uc_opts.add_argument("--disable-dev-shm-usage")
+            uc_opts.add_argument("--disable-notifications")
+            if HEADLESS:
+                uc_opts.add_argument("--headless=new")
+            driver = uc.Chrome(
+                options=uc_opts,
+                # use_subprocess=True isolates the Chrome process from the Python
+                # process – required on CI runners where process group signals
+                # can unexpectedly terminate Chrome before the driver finishes.
+                use_subprocess=True,
+            )
+            logger.info("Using undetected_chromedriver (stealth mode)")
+            return driver
+        except Exception as uc_err:
+            logger.info(
+                "undetected_chromedriver unavailable (%s) – falling back to plain Selenium",
+                uc_err,
+            )
+
+    # ── Option B: plain Selenium Chrome ──────────────────────────────────────
     options = Options()
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
@@ -896,6 +1042,8 @@ def build_driver() -> webdriver.Chrome:
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+    if PROXY_URL:
+        options.add_argument(f"--proxy-server={PROXY_URL}")
     if HEADLESS:
         options.add_argument("--headless=new")
     # Selenium Manager will download/install matching driver automatically on GitHub runners
@@ -1349,25 +1497,57 @@ def main():
         bt = diag["block_type"]
         uuid = diag["support_uuid"]
         if bt == "f5_waf_ip_block":
-            raise MoodleMaintenanceError(
-                f"F5 BIG-IP WAF IP-block on preflight check "
-                f"(url={MY_COURSES_URL!r}, support_uuid={uuid!r})"
-            )
-        if bt == "access_denied":
+            if MOODLE_INJECTED_COOKIES:
+                # The preflight is a plain unauthenticated GET so it gets blocked.
+                # The injected cookies (with F5 TS* trust tokens) are not sent on
+                # a preflight-level request, but the subsequent authenticated requests
+                # will carry them and may succeed.  Continue rather than abort.
+                logger.warning(
+                    "Preflight blocked by F5 WAF (support_uuid=%r) but "
+                    "MOODLE_INJECTED_COOKIES is set – will attempt cookie injection anyway",
+                    uuid,
+                )
+            else:
+                raise MoodleMaintenanceError(
+                    f"F5 BIG-IP WAF IP-block on preflight check "
+                    f"(url={MY_COURSES_URL!r}, support_uuid={uuid!r})"
+                )
+        elif bt == "access_denied":
             raise MoodleMaintenanceError(
                 f"Access-denied page on preflight check "
                 f"(url={MY_COURSES_URL!r}, block_type={bt!r})"
             )
-        # block_type == "maintenance" or unknown – fall through and let login
-        # attempts surface the concrete error with more context.
-        logger.warning(
-            "Preflight: Moodle appears unavailable (block_type=%r) – "
-            "attempting login anyway", bt,
+        else:
+            # block_type == "maintenance" or unknown – fall through and let login
+            # attempts surface the concrete error with more context.
+            logger.warning(
+                "Preflight: Moodle appears unavailable (block_type=%r) – "
+                "attempting login anyway", bt,
+            )
+
+    # ── Attempt -1: Use locally-exported cookies (MOODLE_INJECTED_COOKIES secret) ──
+    # These cookies include F5 BIG-IP TS* trust tokens obtained from a real human
+    # browser on a residential IP.  Injecting them bypasses the WAF bot-score check
+    # that blocks GitHub-hosted runner IPs.
+    # Produced by: export_cookies.py (run locally after debug_browser_capture.py).
+    http_session: "requests.Session | None" = None
+    if MOODLE_INJECTED_COOKIES:
+        logger.info(
+            "MOODLE_INJECTED_COOKIES is set – trying injected F5/Moodle cookies …"
         )
+        http_session = _load_injected_session()
+        if http_session is not None:
+            logger.info("Injected cookies valid – saving to cache for future runs")
+            save_http_session_cookies(http_session)
+        else:
+            logger.warning(
+                "Injected cookies expired or invalid – falling back to other login methods"
+            )
 
     # ── Attempt 0: Reuse saved session cookies (fastest – no login round-trip) ──
-    logger.info("Trying to reuse saved Moodle session cookies…")
-    http_session = load_http_session_from_cookies()
+    if http_session is None:
+        logger.info("Trying to reuse saved Moodle session cookies…")
+        http_session = load_http_session_from_cookies()
 
     if http_session is None:
         # ── Attempt 1: HTTP-based SAML login (no Selenium; avoids headless-Chrome bot detection) ──

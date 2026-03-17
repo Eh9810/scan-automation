@@ -25,6 +25,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install selenium requests beautifulsoup4
+          pip install undetected-chromedriver || echo "undetected-chromedriver not available – stealth mode disabled"
 
       - name: Restore Moodle session cache
         # run_id makes the key unique so the cache is always saved after each run.
@@ -43,6 +44,14 @@ jobs:
           MOODLE_PASSWORD: ${{ secrets.MOODLE_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Cookie injection: pre-exported cookies from a local authenticated session.
+          # Produced by export_cookies.py (run locally after debug_browser_capture.py).
+          # Includes F5 BIG-IP TS* trust tokens that bypass the WAF bot-score block.
+          # Optional – leave unset to rely on SAML/Selenium login instead.
+          MOODLE_INJECTED_COOKIES: ${{ secrets.MOODLE_INJECTED_COOKIES }}
+          # Optional residential proxy to lower the F5 WAF bot score.
+          # Example: "http://user:pass@proxy.example.com:8080"
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
           python moodle_scan.py
 
