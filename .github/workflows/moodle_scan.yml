@@ -41,6 +41,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MOODLE_HEADLESS: "false"
+          MOODLE_COOKIE_SEED_B64: ${{ secrets.MOODLE_COOKIE_SEED_B64 }}
         run: |
           xvfb-run -a python moodle_scan.py
 

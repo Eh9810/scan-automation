@@ -15,6 +15,7 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import unquote, urlparse
 import json
+import base64
 import os
 import re
 import time
@@ -68,6 +69,8 @@ PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+MOODLE_COOKIE_SEED_B64 = os.environ.get("MOODLE_COOKIE_SEED_B64", "")
+MOODLE_COOKIE_SEED_FILE = os.environ.get("MOODLE_COOKIE_SEED_FILE", "")
 
 # ==========================
 # DATA
@@ -135,6 +138,66 @@ def _session_from_selenium_cookies(driver: webdriver.Chrome) -> requests.Session
             path=c.get("path", "/"),
         )
     return s
+
+
+def _load_cookie_seed() -> list[dict]:
+    """Load cookies exported locally (JSON list) from file or base64 env."""
+    raw = ""
+    if MOODLE_COOKIE_SEED_FILE:
+        try:
+            with open(MOODLE_COOKIE_SEED_FILE, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except Exception as e:
+            print(f"[cookie-seed] failed reading file: {e}")
+    elif MOODLE_COOKIE_SEED_B64:
+        try:
+            raw = base64.b64decode(MOODLE_COOKIE_SEED_B64).decode("utf-8")
+        except Exception as e:
+            print(f"[cookie-seed] failed decoding base64: {e}")
+
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict) and x.get("name") and x.get("value")]
+    except Exception as e:
+        print(f"[cookie-seed] invalid json: {e}")
+    return []
+
+
+def _inject_cookie_seed(driver: webdriver.Chrome, cookies: list[dict]) -> None:
+    if not cookies:
+        return
+
+    moodle_cookies = []
+    nidp_cookies = []
+    for c in cookies:
+        d = (c.get("domain") or "").lower()
+        if "nidp.tau.ac.il" in d:
+            nidp_cookies.append(c)
+        else:
+            moodle_cookies.append(c)
+
+    # domain must be open before add_cookie
+    if moodle_cookies:
+        driver.get("https://moodle.tau.ac.il/")
+        for c in moodle_cookies:
+            try:
+                driver.add_cookie(c)
+            except Exception:
+                pass
+
+    if nidp_cookies:
+        driver.get("https://nidp.tau.ac.il/")
+        for c in nidp_cookies:
+            try:
+                driver.add_cookie(c)
+            except Exception:
+                pass
+
+    print(f"[cookie-seed] injected {len(moodle_cookies)} moodle + {len(nidp_cookies)} nidp cookies")
 
 
 def _http_head_follow(session: requests.Session, url: str) -> requests.Response | None:
@@ -826,8 +889,10 @@ def scan_all(session: requests.Session, courses: list[tuple[str, str]], referenc
 # ==========================
 
 def main():
-    # validate required secrets
-    if not USERNAME or not USER_ID or not PASSWORD:
+    cookie_seed = _load_cookie_seed()
+
+    # validate secrets only when no external session seed is provided
+    if not cookie_seed and (not USERNAME or not USER_ID or not PASSWORD):
         raise SystemExit("Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD")
 
     run_start = datetime.now(TZ_IL)
@@ -838,6 +903,8 @@ def main():
         driver = build_driver()
         try:
             print(f"[main] scan attempt {attempt}/3")
+            if cookie_seed:
+                _inject_cookie_seed(driver, cookie_seed)
 
             # Prefer Moodle-side flow first (matches successful manual UX):
             # /local/mycourses/ -> click "התחבר/י" -> NIDP -> back to MyCourses.
