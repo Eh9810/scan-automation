@@ -52,6 +52,14 @@ class MoodleMaintenanceError(Exception):
 LOGIN_URL = "https://nidp.tau.ac.il/nidp/saml2/sso?id=10&sid=0&option=credential&sid=0"
 MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
 MOODLE_DASHBOARD_URL = "https://moodle.tau.ac.il/my/"
+# Moodle-side SAML SP entry point – starting here gives NIDP the RelayState
+# it needs to redirect back to Moodle after authentication (SP-initiated flow).
+MOODLE_SAML_LOGIN_URL = "https://moodle.tau.ac.il/auth/saml2/login.php"
+# Moodle AJAX web-service endpoint used to fetch enrolled courses (same call
+# the browser makes when the JS-loaded course block renders).
+MOODLE_SERVICE_URL = "https://moodle.tau.ac.il/lib/ajax/service.php"
+# Core Moodle "My Courses" page – may contain static course links as a fallback.
+MOODLE_MY_COURSES_PAGE_URL = "https://moodle.tau.ac.il/my/courses.php"
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
 WAIT_SEC = 30
@@ -202,14 +210,20 @@ def _http_saml_login() -> "requests.Session | None":
     Authenticate against TAU NIDP via a plain-HTTP SAML SSO handshake
     (no browser / no Selenium).
 
+    Uses the **SP-initiated** (Moodle-side) flow so that NIDP receives a
+    proper SAMLRequest + RelayState and knows to redirect back to Moodle
+    after authentication.  Going directly to the NIDP IdP URL (the old
+    approach) produced no SAMLResponse because NIDP had no registered SP
+    context and the browser ended up stuck on the NIDP portal page.
+
     Steps:
-      1. GET the NIDP SSO URL  → HTML login form
-      2. POST credentials      → NIDP returns auto-submit SAMLResponse form
-      3. POST SAMLResponse     → Moodle ACS sets session cookie + redirects
+      1. GET Moodle SAML SP entry → NIDP redirect with SAMLRequest
+      2. POST credentials to NIDP → SAMLResponse auto-submit HTML
+      3. POST SAMLResponse to ACS → Moodle sets session cookies
       4. Verify we landed on a real, non-maintenance Moodle page
 
-    Returns a requests.Session with valid Moodle cookies on success, or None on
-    any failure so the caller can fall back to Selenium.
+    Returns a requests.Session with valid Moodle cookies on success, or None
+    on any failure so the caller can fall back to Selenium.
     """
     session = requests.Session()
     session.headers.update({
@@ -219,13 +233,48 @@ def _http_saml_login() -> "requests.Session | None":
     })
 
     try:
-        # ── 1. Fetch NIDP login page ──────────────────────────────────────────
-        logger.info("HTTP login step 1: GET %s", LOGIN_URL)
-        resp = session.get(LOGIN_URL, timeout=30)
+        # ── 1. Trigger Moodle SP-initiated SAML login ────────────────────────
+        # Moodle builds a SAMLRequest and redirects us to NIDP with a proper
+        # RelayState, so NIDP knows where to send the SAMLResponse afterwards.
+        logger.info("HTTP login step 1: GET Moodle SAML SP endpoint %s", MOODLE_SAML_LOGIN_URL)
+        resp = session.get(MOODLE_SAML_LOGIN_URL, timeout=30)
         resp.raise_for_status()
         logger.info("HTTP login step 1: landed on %s (status=%s)", resp.url, resp.status_code)
 
         soup = BeautifulSoup(resp.text, "html.parser")
+        title_el = soup.find("title")
+        title_text = title_el.get_text() if title_el else ""
+
+        # If Moodle itself is blocked/under maintenance, surface it immediately.
+        if "mainten" in title_text.lower():
+            raise MoodleMaintenanceError(
+                f"Moodle SAML endpoint shows maintenance page "
+                f"(url={resp.url!r}, title={title_text!r})"
+            )
+
+        # If we were already authenticated (no redirect to NIDP), we're done.
+        if "moodle.tau.ac.il" in resp.url and "nidp.tau.ac.il" not in resp.url:
+            if "log in" not in title_text.lower() and "sign in" not in title_text.lower():
+                logger.info("HTTP login: already authenticated at %s", resp.url)
+                return session
+
+        # We should now be on the NIDP login page.
+        if "nidp.tau.ac.il" not in resp.url:
+            logger.warning(
+                "HTTP login: expected NIDP redirect after Moodle SAML SP, "
+                "got URL=%s (title=%r) – trying IdP-initiated URL as fallback",
+                resp.url, title_text,
+            )
+            # Fallback: try the NIDP IdP-initiated URL directly.
+            resp = session.get(LOGIN_URL, timeout=30)
+            resp.raise_for_status()
+            logger.info(
+                "HTTP login step 1 (fallback): landed on %s (status=%s)",
+                resp.url, resp.status_code,
+            )
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+        # ── 2. Submit credentials to NIDP ────────────────────────────────────
         # Prefer the form that has a password field; fall back to the first form.
         form = None
         for f in soup.find_all("form"):
@@ -243,10 +292,9 @@ def _http_saml_login() -> "requests.Session | None":
             return None
 
         action, data = _form_to_dict(form, resp.url)
-        logger.info("HTTP login step 1: form action=%s, fields=%s", action, list(data.keys()))
+        logger.info("HTTP login step 2: form action=%s, fields=%s", action, list(data.keys()))
         _fill_nidp_credentials(data)
 
-        # ── 2. Submit credentials to NIDP ────────────────────────────────────
         logger.info("HTTP login step 2: POST credentials to %s", action)
         resp = session.post(action, data=data, timeout=30)
         resp.raise_for_status()
@@ -290,6 +338,8 @@ def _http_saml_login() -> "requests.Session | None":
         logger.info("HTTP login succeeded – landed on %s (title=%r)", resp.url, title_text)
         return session
 
+    except MoodleMaintenanceError:
+        raise  # let caller handle
     except Exception as exc:
         logger.warning("HTTP login failed: %s", exc)
         return None
@@ -315,14 +365,92 @@ def _http_get_html(session: requests.Session, url: str) -> str | None:
         return None
 
 
+def _get_sesskey_from_html(html: str) -> str | None:
+    """Extract the Moodle sesskey embedded in the M.cfg JavaScript block."""
+    m = re.search(r'"sesskey"\s*:\s*"([A-Za-z0-9]{6,})"', html)
+    return m.group(1) if m else None
+
+
+def _get_courses_via_api(session: requests.Session, sesskey: str) -> list:
+    """
+    Fetch enrolled courses using the Moodle AJAX web-service API.
+
+    This is the exact same call the browser makes when the JS-rendered
+    course block populates ``data-region="courses-list"``.  Because it is
+    a plain HTTP POST it works even when the static HTML is empty.
+
+    Returns a de-duplicated list of (raw_course_name, course_url) tuples.
+    """
+    endpoint = f"{MOODLE_SERVICE_URL}?sesskey={sesskey}"
+    # The TAU-custom block function; fall back to the Moodle-core equivalent.
+    for methodname in (
+        "block_mycourses_get_enrolled_courses_by_timeline_classification",
+        "core_course_get_enrolled_courses_by_timeline_classification",
+    ):
+        payload = [{
+            "index": 0,
+            "methodname": methodname,
+            "args": {
+                "offset": 0,
+                "limit": 0,
+                "classification": "all",
+                "customfieldname": "",
+                "customfieldvalue": "",
+                "searchvalue": "",
+            },
+        }]
+        try:
+            r = session.post(endpoint, json=payload, timeout=30)
+            if r.status_code >= 400:
+                logger.warning("API courses: %s returned HTTP %s", methodname, r.status_code)
+                continue
+            data = r.json()
+            if not isinstance(data, list) or not data:
+                continue
+            item = data[0]
+            if item.get("error"):
+                logger.warning(
+                    "API courses: %s returned error: %s",
+                    methodname,
+                    item.get("exception", {}).get("message", ""),
+                )
+                continue
+            courses_data = item.get("data", {})
+            if isinstance(courses_data, dict):
+                courses_data = courses_data.get("courses", [])
+            if not isinstance(courses_data, list) or not courses_data:
+                continue
+            courses = [
+                (c.get("fullname") or c.get("shortname", ""), c.get("viewurl", ""))
+                for c in courses_data
+                if c.get("viewurl") and "course/view.php" in c.get("viewurl", "")
+            ]
+            courses = [(n, u) for n, u in courses if n]
+            if courses:
+                logger.info(
+                    "API courses: found %d courses via %s", len(courses), methodname
+                )
+                return courses
+        except Exception as exc:
+            logger.warning("API courses via %s failed: %s", methodname, exc)
+    return []
+
+
 def _get_courses_via_http(session: requests.Session) -> list:
     """
     Fetch the enrolled-course list using a plain-HTTP session (no Selenium).
 
-    Tries MY_COURSES_URL first, then MOODLE_DASHBOARD_URL as a fallback.
+    Strategy (first success wins):
+    1. For each candidate URL, extract the Moodle ``sesskey`` from M.cfg and
+       call the AJAX web-service API – this bypasses the JS-loaded course list.
+    2. If the API returns nothing, fall back to static HTML link scraping.
+
+    Candidate URLs tried in order: MY_COURSES_URL, MOODLE_DASHBOARD_URL,
+    MOODLE_MY_COURSES_PAGE_URL.
+
     Returns a de-duplicated list of (raw_course_name, course_url) tuples.
     """
-    for url in (MY_COURSES_URL, MOODLE_DASHBOARD_URL):
+    for url in (MY_COURSES_URL, MOODLE_DASHBOARD_URL, MOODLE_MY_COURSES_PAGE_URL):
         html = _http_get_html(session, url)
         if not html:
             logger.warning("HTTP courses: could not fetch %s", url)
@@ -338,6 +466,19 @@ def _get_courses_via_http(session: requests.Session) -> list:
             )
             continue
 
+        # ── Strategy 1: Moodle AJAX web-service API ──────────────────────────
+        # The course block renders via AJAX so static HTML is usually empty.
+        # Extract the sesskey from M.cfg and call the same endpoint the browser
+        # uses.  This is the most reliable approach.
+        sesskey = _get_sesskey_from_html(html)
+        if sesskey:
+            logger.info("HTTP courses: sesskey found at %s, trying API", url)
+            courses = _get_courses_via_api(session, sesskey)
+            if courses:
+                return courses
+            logger.warning("HTTP courses: API returned no courses from %s – trying HTML scraping", url)
+
+        # ── Strategy 2: Static HTML link scraping ────────────────────────────
         courses: list = []
         seen: set = set()
         for a in soup.find_all("a", href=True):
@@ -350,10 +491,10 @@ def _get_courses_via_http(session: requests.Session) -> list:
                 seen.add(href)
 
         if courses:
-            logger.info("HTTP courses: found %d unique courses at %s", len(courses), url)
+            logger.info("HTTP courses: found %d unique courses at %s (HTML)", len(courses), url)
             return courses
 
-        logger.warning("HTTP courses: no courses found at %s – trying fallback", url)
+        logger.warning("HTTP courses: no courses found at %s – trying next URL", url)
 
     return []
 
@@ -790,12 +931,25 @@ def _is_maintenance_page(driver: webdriver.Chrome) -> bool:
 
 
 def _courses_detected(d) -> bool:
-    """Return True if any course-list element or guest-access indicator is found."""
+    """Return True if any course-list element, guest-access indicator, or
+    the logged-in Moodle course block container is present.
+
+    The ``data-region="mycourses"`` and ``data-region="courses-list"``
+    containers appear in the DOM as soon as the page loads even before the
+    AJAX request that fills them completes, so their presence means we are
+    on a real, logged-in Moodle page.  Returning True early avoids a 30-second
+    timeout simply because AJAX hasn't finished yet.
+    """
     for sel in _COURSE_CSS_SELECTORS:
         if d.find_elements(By.CSS_SELECTOR, sel):
             return True
     if d.find_elements(By.XPATH, _GUEST_XPATH):
         return True
+    # Logged-in Moodle page with course block (list may still be AJAX-loading)
+    for sel in ("[data-region='mycourses']", "[data-block='mycourses']",
+                "[data-region='courses-list']"):
+        if d.find_elements(By.CSS_SELECTOR, sel):
+            return True
     return False
 
 
@@ -836,7 +990,17 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
 
     if click_login_if_guest(driver):
         logger.info("Guest access detected – clicking login link")
-        time.sleep(2)
+        # Wait for the browser to land on NIDP or return directly to Moodle
+        # (a bare time.sleep risks missing the redirect on slow runners).
+        try:
+            WebDriverWait(driver, WAIT_SEC).until(
+                lambda d: (
+                    "nidp.tau.ac.il" in d.current_url.lower()
+                    or "moodle.tau.ac.il" in d.current_url.lower()
+                )
+            )
+        except Exception:
+            pass
 
         if "nidp.tau.ac.il" in driver.current_url.lower():
             logger.info("Redirected to NIDP – filling SSO form")
@@ -911,12 +1075,30 @@ def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
             courses.append((name, href))
 
     if not courses:
+        # The course list is rendered via AJAX; if it hasn't loaded yet (or
+        # uses a DOM structure we don't match), fall back to the Moodle
+        # web-service API using the sesskey from the live page.
         logger.warning(
-            "No courses found on MyCourses page (url=%s, title=%s). "
-            "The page structure may have changed.",
-            driver.current_url,
-            driver.title,
+            "No courses found via DOM selectors (url=%s, title=%s) – "
+            "trying Moodle web-service API",
+            driver.current_url, driver.title,
         )
+        try:
+            sesskey = driver.execute_script(
+                "return (typeof M !== 'undefined' && M.cfg) ? M.cfg.sesskey : null;"
+            )
+        except Exception:
+            sesskey = None
+
+        if sesskey:
+            http_session = _session_from_selenium_cookies(driver)
+            courses = _get_courses_via_api(http_session, sesskey)
+            if courses:
+                logger.info("Got %d courses via web-service API fallback", len(courses))
+            else:
+                logger.warning("Web-service API also returned no courses")
+        else:
+            logger.warning("Could not obtain sesskey from browser – no API fallback available")
 
     uniq: list[tuple[str, str]] = []
     seen = set()
@@ -1044,15 +1226,19 @@ def main():
         logger.warning("HTTP mode: login succeeded but no courses found – falling back to Selenium")
 
     # ── Attempt 2: Fall back to Selenium browser login ──
+    # Start from Moodle's MyCourses page (SP-initiated SAML flow).
+    # get_courses → ensure_logged_in_moodle handles the full flow:
+    #   1. Navigate to MY_COURSES_URL
+    #   2. Click the "התחבר/י" login button → redirected to /login/index.php
+    #      → redirected to NIDP with proper SAMLRequest + RelayState
+    #   3. Fill NIDP credentials
+    #   4. NIDP POSTs SAMLResponse to Moodle ACS → Moodle sets cookies
+    #   5. Return to MY_COURSES_URL as an authenticated user
+    # Going directly to LOGIN_URL (NIDP IdP-initiated) must be avoided because
+    # NIDP has no SP context and ends up on the portal page instead of Moodle.
     logger.info("Falling back to Selenium browser login…")
     driver = build_driver()
     try:
-        driver.get(LOGIN_URL)
-
-        # if we see NIDP form -> fill; otherwise might already be logged in
-        maybe_login_nidp(driver)
-        ensure_on_moodle(driver)
-
         courses = get_courses(driver)
         print(f"\nFound {len(courses)} courses.\n")
 
