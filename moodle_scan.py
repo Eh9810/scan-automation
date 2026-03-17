@@ -2,12 +2,9 @@
 """
 TAU Moodle scanner (GitHub Actions-ready):
 - Login to TAU NIDP (SSO) via undetected-chromedriver (to bypass F5 WAF)
-- Go to My Courses
-- Scan course pages for pluginfile links + resolve resource/folder/assign
-- Use HTTP Last-Modified as "שינוי אחרון"
-- Check only what changed since last run (stored in last_run.json)
-- If there are updates -> send Telegram message (no updates -> send nothing)
-- If there is an error -> send Telegram message with the GitHub Actions run link + traceback
+- Handle dynamic Moodle UI (blocks/cards)
+- Detect WAF blocks explicitly
+- Send detailed Telegram alerts on failure
 """
 
 from dataclasses import dataclass
@@ -51,14 +48,12 @@ TZ_IL = ZoneInfo("Asia/Jerusalem")
 WAIT_SEC = 30
 HEADLESS = False  # Changed to False since we run under Xvfb in GitHub Actions
 
-STATE_FILE = "last_run.json"  # will be created/updated in repo
+STATE_FILE = "last_run.json"
 
 
 # ==========================
 # SECRETS (from GitHub Actions)
 # ==========================
-# IMPORTANT: do NOT hardcode secrets here.
-# Put them in GitHub -> Settings -> Secrets and variables -> Actions -> Secrets.
 USERNAME = os.environ.get("MOODLE_USERNAME", "")
 USER_ID = os.environ.get("MOODLE_USER_ID", "")
 PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
@@ -85,10 +80,6 @@ class FoundFile:
 # ==========================
 
 def _course_display_name(raw: str) -> str:
-    """
-    Convert '05092843 - אנליזה הרמונית' -> 'אנליזה הרמונית'
-    Keep others as-is.
-    """
     s = (raw or "").strip()
     if " - " in s:
         left, right = s.split(" - ", 1)
@@ -246,9 +237,7 @@ def _format_line(item: FoundFile) -> str:
 # ==========================
 
 def load_last_run() -> datetime:
-    # default: last hour (so first run won't spam months)
     fallback = datetime.now(TZ_IL) - timedelta(hours=1)
-
     if not os.path.exists(STATE_FILE):
         return fallback
 
@@ -292,7 +281,6 @@ def telegram_send(text: str) -> None:
 
 
 def telegram_send_many(lines: list[str], header: str) -> None:
-    # Telegram limit ~4096 chars per message → split safely
     max_len = 3800
     chunk = header + "\n"
     for line in lines:
@@ -305,7 +293,6 @@ def telegram_send_many(lines: list[str], header: str) -> None:
 
 
 def github_run_url() -> str:
-    # https://github.com/<owner>/<repo>/actions/runs/<run_id>
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     if repo and run_id:
@@ -336,19 +323,13 @@ def build_driver() -> webdriver.Chrome:
     except Exception as e:
         print(f"Could not detect Chrome version, defaulting to {v_main}. Error: {e}")
 
-    # הרצה עם الجרסה שאותרה ובלי Headless כדי לא להיתפס ב-WAF
     driver = uc.Chrome(options=options, version_main=v_main)
-    
     driver.set_window_size(1920, 1080)
     driver.implicitly_wait(10)
     return driver
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
-    """
-    Return the first element that is BOTH displayed and enabled.
-    (Prevents picking hidden/overlayed fields that cause ElementNotInteractableException)
-    """
     for v in values:
         try:
             el = driver.find_element(by, v)
@@ -360,10 +341,6 @@ def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
 
 
 def maybe_login_nidp(driver: webdriver.Chrome) -> None:
-    """
-    Fill the TAU NIDP SSO form if it appears.
-    Robust against multiple possible field IDs AND hidden duplicates.
-    """
     wait = WebDriverWait(driver, WAIT_SEC)
 
     user_ids = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
@@ -376,16 +353,13 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
     try:
         wait.until(any_visible_login_field_present)
     except Exception:
-        # no login form detected
         return
 
     def _safe_fill(el, value: str):
-        # scroll + focus
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         except Exception:
             pass
-
         try:
             el.click()
         except Exception:
@@ -393,15 +367,12 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
                 driver.execute_script("arguments[0].click();", el)
             except Exception:
                 pass
-
-        # clear via keyboard (more reliable than clear())
         try:
             el.send_keys(Keys.CONTROL, "a")
             el.send_keys(Keys.BACKSPACE)
             el.send_keys(value)
             return
         except Exception:
-            # last resort: set via JS + fire input/change
             driver.execute_script(
                 "arguments[0].value = arguments[1];"
                 "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
@@ -472,27 +443,36 @@ def click_login_if_guest(driver: webdriver.Chrome) -> bool:
 
 
 def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
-    """
-    Go to MyCourses.
-    If guest access -> click login -> complete SSO -> back to MyCourses.
-    """
     wait = WebDriverWait(driver, WAIT_SEC)
     driver.get(MY_COURSES_URL)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(0.8)
+    time.sleep(1)
+
+    # בדיקת חסימת WAF עוד לפני שמנסים לעשות משהו
+    if "TAU Under Maintenence" in driver.title or "Access denied" in driver.page_source:
+        raise RuntimeError("WAF Blocked directly on My Courses page!")
 
     if click_login_if_guest(driver):
-        time.sleep(1.2)
-
+        time.sleep(2)
         if "nidp.tau.ac.il" in driver.current_url.lower():
             maybe_login_nidp(driver)
             ensure_on_moodle(driver)
-
         driver.get(MY_COURSES_URL)
 
     def courses_or_guest(d):
+        if "TAU Under Maintenence" in d.title or "Access denied" in d.page_source:
+            raise RuntimeError("WAF Blocked during login/redirect!")
+            
+        # סלקטור ישן
         if d.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename"):
             return True
+        # סלקטור חדש שמבוסס על הקישורים עצמם
+        if d.find_elements(By.XPATH, "//a[contains(@href, 'course/view.php?id=')]"):
+            return True
+        # זיהוי מצב טעינה או בלוק UI חדש של מודל
+        if d.find_elements(By.CSS_SELECTOR, "[data-block='mycourses']"):
+            return True
+        # מצב אורח
         if d.find_elements(By.XPATH, "//*[contains(., 'גישת אורחים')]"):
             return True
         return False
@@ -506,16 +486,25 @@ def ensure_logged_in_moodle(driver: webdriver.Chrome) -> None:
 def get_courses(driver: webdriver.Chrome) -> list[tuple[str, str]]:
     ensure_logged_in_moodle(driver)
 
-    wait = WebDriverWait(driver, WAIT_SEC)
-    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.mycourses_coursename")))
+    # המתנה לטעינת AJAX / Cards במבנה החדש של מודל
+    time.sleep(4)
 
+    # נחפש בסלקטור הישן, ואם אין כלום, נחפש בסלקטור החדש
     links = driver.find_elements(By.CSS_SELECTOR, "a.mycourses_coursename")
+    if not links:
+        links = driver.find_elements(By.XPATH, "//a[contains(@href, 'course/view.php?id=')]")
+
     courses: list[tuple[str, str]] = []
     for a in links:
         name = (a.text or "").strip()
+        # לעיתים במבנה החדש הטקסט מוסתר ולכן כדאי לנסות לשלוף מתגית
+        if not name:
+            name = a.get_attribute("title") or a.get_attribute("aria-label") or ""
+        
         href = a.get_attribute("href")
-        if name and href and "course/view.php?id=" in href:
-            courses.append((name, href))
+        if href and "course/view.php?id=" in href:
+            if name:  # מוסיפים רק אם מצאנו שם
+                courses.append((name, href))
 
     uniq: list[tuple[str, str]] = []
     seen = set()
@@ -606,18 +595,17 @@ def scan_all(session: requests.Session, courses: list[tuple[str, str]], referenc
 # ==========================
 
 def main():
-    # validate required secrets
     if not USERNAME or not USER_ID or not PASSWORD:
         raise SystemExit("Missing Moodle secrets: MOODLE_USERNAME / MOODLE_USER_ID / MOODLE_PASSWORD")
 
     run_start = datetime.now(TZ_IL)
     last_run = load_last_run()
+    driver = None
 
-    driver = build_driver()
     try:
+        driver = build_driver()
         driver.get(LOGIN_URL)
 
-        # if we see NIDP form -> fill; otherwise might already be logged in
         maybe_login_nidp(driver)
         ensure_on_moodle(driver)
 
@@ -627,7 +615,6 @@ def main():
         session = _session_from_selenium_cookies(driver)
         results = scan_all(session, courses, last_run)
 
-        # Update state even if no results (so next run checks only since now)
         save_last_run(run_start)
 
         if not results:
@@ -638,29 +625,37 @@ def main():
         header = f"📌 עדכונים במודל מאז {last_run.strftime('%d.%m.%Y %H:%M')} ({len(lines)}):"
         telegram_send_many(lines, header)
 
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-
-if __name__ == "__main__":
-    try:
-        main()
     except Exception as e:
-        # send error to Telegram (very important)
         run_link = github_run_url()
         tb = traceback.format_exc()
 
-        msg = "❌ Moodle scan failed (Exception)\n"
+        msg = "❌ Moodle scan failed\n"
+        
+        # הדפסת העמוד המדויק שבו הסקריפט קרס כדי לדעת אם עקפנו את ה-WAF
+        if driver:
+            try:
+                msg += f"URL: {driver.current_url}\n"
+                msg += f"Title: {driver.title}\n\n"
+            except:
+                pass
+        
         if run_link:
             msg += f"🔗 Logs: {run_link}\n\n"
+            
         msg += tb
 
-        # Telegram has length limits; clip a bit
         if len(msg) > 3800:
             msg = msg[:3800] + "\n...\n(Traceback clipped)"
 
         telegram_send(msg)
         raise
+        
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+
+if __name__ == "__main__":
+    main()
