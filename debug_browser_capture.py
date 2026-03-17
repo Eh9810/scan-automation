@@ -87,19 +87,25 @@ _BLOCK_INDICATORS = {
     ],
     "bot_score": [
         re.compile(r"bot\s*(score|detect|challeng)", re.I),
-        re.compile(r"captcha", re.I),
+        # "captcha" is intentionally omitted – the NIDP login page references
+        # reCAPTCHA in its HTML even during a normal, successful SSO flow, so
+        # matching it here causes false positives on legitimate login pages.
         re.compile(r"אתה רובוט|are you a robot", re.I),
     ],
     "rate_limit": [
-        re.compile(r"429|rate.?limit|too many requests", re.I),
+        # Bare "429" is too broad – it matches course IDs, form fields, etc.
+        # This pattern requires "429" to appear next to an HTTP/Error/status
+        # keyword, OR next to "too many"/"rate" (e.g. "429 Too Many Requests").
+        re.compile(r"(?:HTTP|Error|status)[^0-9]{0,10}429\b|429[^0-9]{0,20}(?:too.{0,10}many|rate)", re.I),
+        re.compile(r"rate.?limit|too many requests", re.I),
         re.compile(r"נחסמת זמנית|temporarily blocked", re.I),
     ],
     "geo_asn": [
         re.compile(r"geo.?(block|restrict)|country.?block|asn.?block", re.I),
     ],
-    "maintenance": [
-        re.compile(r"mainten", re.I),
-    ],
+    # NOTE: "maintenance" is NOT listed here; it is handled separately inside
+    # detect_block_type() using a title-based check to prevent false positives
+    # from "maintenance" appearing in Moodle footer/admin links on normal pages.
 }
 
 # Security-relevant response headers to capture
@@ -282,7 +288,20 @@ def _get_performance_logs(driver: webdriver.Chrome) -> list[dict]:
 # =============================================================================
 
 def detect_block_type(html: str) -> str:
-    """Classify the WAF/security block type from page HTML."""
+    """Classify the WAF/security block type from page HTML.
+
+    The function extracts the ``<title>`` tag first and uses it for the
+    "maintenance" check so that occurrences of "maintenance" buried in
+    footers, admin menus, or help-link text on otherwise normal pages do
+    NOT trigger a false-positive classification.
+    """
+    # ── Title-based "maintenance" check (most reliable, avoids false positives) ──
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.DOTALL)
+    page_title = title_match.group(1).lower() if title_match else ""
+    if "mainten" in page_title:
+        return "maintenance"
+
+    # ── Pattern-based checks for all other block types ──
     for block_type, patterns in _BLOCK_INDICATORS.items():
         for pat in patterns:
             if pat.search(html):

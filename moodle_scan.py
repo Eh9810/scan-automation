@@ -77,7 +77,12 @@ def _detect_block_type(html: str) -> str:
     lower = html.lower()
     if any(p in lower for p in _ACCESS_DENIED_TEXTS):
         return "access_denied"
-    if "mainten" in lower:
+    # Use the page <title> for the maintenance check to avoid false positives
+    # from "maintenance" appearing in footer links or admin menus on normal
+    # Moodle pages (e.g. "report a maintenance issue" in the help section).
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    page_title = (title_match.group(1) if title_match else "").lower()
+    if "mainten" in page_title:
         return "maintenance"
     return "ok"
 
@@ -1513,10 +1518,19 @@ def main():
                     f"(url={MY_COURSES_URL!r}, support_uuid={uuid!r})"
                 )
         elif bt == "access_denied":
-            raise MoodleMaintenanceError(
-                f"Access-denied page on preflight check "
-                f"(url={MY_COURSES_URL!r}, block_type={bt!r})"
-            )
+            if MOODLE_INJECTED_COOKIES:
+                # Same reasoning as f5_waf_ip_block: the preflight is unauthenticated
+                # and may be denied, but the authenticated requests with injected TS*
+                # and session cookies can still succeed.  Log and continue.
+                logger.warning(
+                    "Preflight returned access_denied but MOODLE_INJECTED_COOKIES is set "
+                    "– will attempt cookie injection anyway",
+                )
+            else:
+                raise MoodleMaintenanceError(
+                    f"Access-denied page on preflight check "
+                    f"(url={MY_COURSES_URL!r}, block_type={bt!r})"
+                )
         else:
             # block_type == "maintenance" or unknown – fall through and let login
             # attempts surface the concrete error with more context.
