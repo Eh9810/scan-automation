@@ -167,6 +167,34 @@ def _load_cookie_seed() -> list[dict]:
     return []
 
 
+def _sanitize_cookie_for_selenium(c: dict) -> dict:
+    out = {
+        "name": c.get("name"),
+        "value": c.get("value"),
+        "path": c.get("path", "/"),
+    }
+    if c.get("domain"):
+        out["domain"] = c.get("domain")
+    if c.get("expiry") is not None:
+        try:
+            out["expiry"] = int(float(c.get("expiry")))
+        except Exception:
+            pass
+    if c.get("secure") is not None:
+        out["secure"] = bool(c.get("secure"))
+
+    # Selenium only accepts Strict/Lax/None (case-sensitive)
+    ss = str(c.get("sameSite", "")).strip().lower()
+    if ss == "strict":
+        out["sameSite"] = "Strict"
+    elif ss == "lax":
+        out["sameSite"] = "Lax"
+    elif ss == "none":
+        out["sameSite"] = "None"
+
+    return out
+
+
 def _inject_cookie_seed(driver: webdriver.Chrome, cookies: list[dict]) -> None:
     if not cookies:
         return
@@ -185,7 +213,7 @@ def _inject_cookie_seed(driver: webdriver.Chrome, cookies: list[dict]) -> None:
         driver.get("https://moodle.tau.ac.il/")
         for c in moodle_cookies:
             try:
-                driver.add_cookie(c)
+                driver.add_cookie(_sanitize_cookie_for_selenium(c))
             except Exception:
                 pass
 
@@ -193,7 +221,7 @@ def _inject_cookie_seed(driver: webdriver.Chrome, cookies: list[dict]) -> None:
         driver.get("https://nidp.tau.ac.il/")
         for c in nidp_cookies:
             try:
-                driver.add_cookie(c)
+                driver.add_cookie(_sanitize_cookie_for_selenium(c))
             except Exception:
                 pass
 
