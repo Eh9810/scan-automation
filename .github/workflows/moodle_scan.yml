@@ -33,7 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb
 
-      - name: Run scanner
+      - name: Run scanner with Virtual Display
         env:
           MOODLE_USERNAME: ${{ secrets.MOODLE_USERNAME }}
           MOODLE_USER_ID: ${{ secrets.MOODLE_USER_ID }}
@@ -43,7 +43,7 @@ jobs:
           MOODLE_HEADLESS: "false"
           MOODLE_COOKIE_SEED_B64: ${{ secrets.MOODLE_COOKIE_SEED_B64 }}
         run: |
-          xvfb-run -a python moodle_scan.py
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python moodle_scan.py
 
       - name: Upload login debug artifact on failure
         if: failure()
