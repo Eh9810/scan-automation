@@ -383,8 +383,11 @@ def _http_saml_login() -> "requests.Session | None":
         title_text = title_el.get_text() if title_el else ""
 
         # If Moodle itself is blocked/under maintenance, surface it immediately.
-        if "mainten" in title_text.lower():
-            block_type = _detect_block_type(resp.text)
+        # Use _detect_block_type() rather than a title-only check so that
+        # "access denied" type blocks (without "mainten" in the title) are
+        # also caught.
+        block_type = _detect_block_type(resp.text)
+        if block_type != "ok":
             support_uuid = _extract_f5_support_uuid(resp.text)
             raise MoodleMaintenanceError(
                 f"Moodle SAML endpoint shows maintenance/block page "
@@ -469,9 +472,10 @@ def _http_saml_login() -> "requests.Session | None":
         soup = BeautifulSoup(resp.text, "html.parser")
         title_el = soup.find("title")
         title_text = title_el.get_text() if title_el else ""
-        # "mainten" matches both the correct spelling and the TAU server's misspelling "Maintenence"
-        if "mainten" in title_text.lower():
-            block_type = _detect_block_type(resp.text)
+        # "mainten" matches both the correct spelling and the TAU server's misspelling "Maintenence".
+        # Use _detect_block_type() so that "access denied" type blocks are also caught.
+        block_type = _detect_block_type(resp.text)
+        if block_type != "ok":
             support_uuid = _extract_f5_support_uuid(resp.text)
             logger.warning(
                 "HTTP login: maintenance/block page on landing URL %s "
@@ -605,10 +609,11 @@ def _get_courses_via_http(session: requests.Session) -> list:
         soup = BeautifulSoup(html, "html.parser")
         title_el = soup.find("title")
         title_text = (title_el.get_text() if title_el else "").lower()
-        if "mainten" in title_text:
+        block_type = _detect_block_type(html)
+        if block_type != "ok":
             logger.warning(
-                "HTTP courses: maintenance page at %s (title=%r) – trying fallback",
-                url, title_text,
+                "HTTP courses: blocked/maintenance page (block_type=%r) at %s – trying fallback",
+                block_type, url,
             )
             continue
 
@@ -853,11 +858,11 @@ def load_http_session_from_cookies() -> "requests.Session | None":
     title_el = soup.find("title")
     title_text = (title_el.get_text() if title_el else "").lower()
 
-    if "mainten" in title_text:
-        block_type = _detect_block_type(html)
+    block_type = _detect_block_type(html)
+    if block_type != "ok":
         support_uuid = _extract_f5_support_uuid(html)
         logger.warning(
-            "Cookie reuse: maintenance/block page (title=%r, block_type=%r%s)",
+            "Cookie reuse: blocked/maintenance page (title=%r, block_type=%r%s)",
             title_text, block_type,
             f", support_uuid={support_uuid!r}" if support_uuid else "",
         )
@@ -940,11 +945,11 @@ def _load_injected_session() -> "requests.Session | None":
     title_el = soup.find("title")
     title_text = (title_el.get_text() if title_el else "").lower()
 
-    if "mainten" in title_text:
-        block_type = _detect_block_type(html)
+    block_type = _detect_block_type(html)
+    if block_type != "ok":
         support_uuid = _extract_f5_support_uuid(html)
         logger.warning(
-            "Injected cookies: maintenance/block page (title=%r, block_type=%r%s)",
+            "Injected cookies: blocked/maintenance page (title=%r, block_type=%r%s)",
             title_text, block_type,
             f", support_uuid={support_uuid!r}" if support_uuid else "",
         )
