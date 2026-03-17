@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 TAU Moodle scanner (GitHub Actions-ready):
-- Login to TAU NIDP (SSO) via Selenium headless Chrome
+- Login to TAU NIDP (SSO) via undetected-chromedriver (to bypass F5 WAF)
 - Go to My Courses
 - Scan course pages for pluginfile links + resolve resource/folder/assign
 - Use HTTP Last-Modified as "שינוי אחרון"
@@ -24,9 +24,9 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import undetected_chromedriver as uc
 
 try:
     from bs4 import BeautifulSoup
@@ -48,7 +48,7 @@ MY_COURSES_URL = "https://moodle.tau.ac.il/local/mycourses/"
 
 TZ_IL = ZoneInfo("Asia/Jerusalem")
 WAIT_SEC = 30
-HEADLESS = True
+HEADLESS = False  # Changed to False since we run under Xvfb in GitHub Actions
 
 STATE_FILE = "last_run.json"  # will be created/updated in repo
 
@@ -317,15 +317,21 @@ def github_run_url() -> str:
 # ==========================
 
 def build_driver() -> webdriver.Chrome:
-    options = Options()
+    options = uc.ChromeOptions()
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    if HEADLESS:
-        options.add_argument("--headless=new")
-    # Selenium Manager will download/install matching driver automatically on GitHub runners
-    return webdriver.Chrome(options=options)
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    
+    # חשוב: אנחנו לא משתמשים ב-headless. 
+    # גיטהאב יריץ את זה בתוך Xvfb (מסך וירטואלי) ולכן ה-WAF של F5 
+    # יחשוב שזה מחשב רגיל לחלוטין עם מסך פעיל.
+    driver = uc.Chrome(options=options)
+    
+    driver.set_window_size(1920, 1080)
+    driver.implicitly_wait(10)
+    return driver
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
