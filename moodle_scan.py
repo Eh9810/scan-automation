@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 TAU Moodle scanner (GitHub Actions-ready):
-- Login to TAU NIDP (SSO) via Selenium headless Chrome
-- Go to My Courses
-- Scan course pages for pluginfile links + resolve resource/folder/assign
-- Use HTTP Last-Modified as "שינוי אחרון"
-- Check only what changed since last run (stored in last_run.json)
-- If there are updates -> send Telegram message (no updates -> send nothing)
-- If there is an error -> send Telegram message with the GitHub Actions run link + traceback
+- Login to TAU NIDP (SSO) via undetected-chromedriver (to bypass F5 WAF)
+- Handle dynamic Moodle UI (blocks/cards)
+- Detect WAF blocks explicitly
+- Send detailed Telegram alerts on failure
 """
 
 from dataclasses import dataclass
@@ -26,9 +23,9 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import undetected_chromedriver as uc
 
 try:
     from bs4 import BeautifulSoup
@@ -60,8 +57,6 @@ LOGIN_DEBUG_HTML = "login_debug_page.html"
 # ==========================
 # SECRETS (from GitHub Actions)
 # ==========================
-# IMPORTANT: do NOT hardcode secrets here.
-# Put them in GitHub -> Settings -> Secrets and variables -> Actions -> Secrets.
 USERNAME = os.environ.get("MOODLE_USERNAME", "")
 USER_ID = os.environ.get("MOODLE_USER_ID", "")
 PASSWORD = os.environ.get("MOODLE_PASSWORD", "")
@@ -90,10 +85,6 @@ class FoundFile:
 # ==========================
 
 def _course_display_name(raw: str) -> str:
-    """
-    Convert '05092843 - אנליזה הרמונית' -> 'אנליזה הרמונית'
-    Keep others as-is.
-    """
     s = (raw or "").strip()
     if " - " in s:
         left, right = s.split(" - ", 1)
@@ -354,9 +345,7 @@ def _format_line(item: FoundFile) -> str:
 # ==========================
 
 def load_last_run() -> datetime:
-    # default: last hour (so first run won't spam months)
     fallback = datetime.now(TZ_IL) - timedelta(hours=1)
-
     if not os.path.exists(STATE_FILE):
         return fallback
 
@@ -400,7 +389,6 @@ def telegram_send(text: str) -> None:
 
 
 def telegram_send_many(lines: list[str], header: str) -> None:
-    # Telegram limit ~4096 chars per message → split safely
     max_len = 3800
     chunk = header + "\n"
     for line in lines:
@@ -413,7 +401,6 @@ def telegram_send_many(lines: list[str], header: str) -> None:
 
 
 def github_run_url() -> str:
-    # https://github.com/<owner>/<repo>/actions/runs/<run_id>
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     if repo and run_id:
@@ -434,7 +421,7 @@ def _human_delay(base: float = 0.5, jitter: float = 0.8) -> None:
         time.sleep(base)
 
 def build_driver() -> webdriver.Chrome:
-    options = Options()
+    options = uc.ChromeOptions()
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--no-sandbox")
@@ -459,10 +446,6 @@ def build_driver() -> webdriver.Chrome:
 
 
 def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
-    """
-    Return the first element that is BOTH displayed and enabled.
-    (Prevents picking hidden/overlayed fields that cause ElementNotInteractableException)
-    """
     for v in values:
         try:
             el = driver.find_element(by, v)
@@ -474,10 +457,6 @@ def _find_any(driver: webdriver.Chrome, by: By, values: list[str]):
 
 
 def maybe_login_nidp(driver: webdriver.Chrome) -> None:
-    """
-    Fill the TAU NIDP SSO form if it appears.
-    Robust against multiple possible field IDs AND hidden duplicates.
-    """
     wait = WebDriverWait(driver, WAIT_SEC)
 
     user_ids = ["Ecom_User_ID", "Ecom_UserID", "Ecom_Username", "username", "user"]
@@ -490,16 +469,13 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
     try:
         wait.until(any_visible_login_field_present)
     except Exception:
-        # no login form detected
         return
 
     def _safe_fill(el, value: str):
-        # scroll + focus
         try:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         except Exception:
             pass
-
         try:
             el.click()
         except Exception:
@@ -507,15 +483,12 @@ def maybe_login_nidp(driver: webdriver.Chrome) -> None:
                 driver.execute_script("arguments[0].click();", el)
             except Exception:
                 pass
-
-        # clear via keyboard (more reliable than clear())
         try:
             el.send_keys(Keys.CONTROL, "a")
             el.send_keys(Keys.BACKSPACE)
             el.send_keys(value)
             return
         except Exception:
-            # last resort: set via JS + fire input/change
             driver.execute_script(
                 "arguments[0].value = arguments[1];"
                 "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
@@ -925,6 +898,7 @@ def main():
 
     run_start = datetime.now(TZ_IL)
     last_run = load_last_run()
+    driver = None
 
     last_exc: Exception | None = None
     for attempt in range(1, 4):
@@ -1004,18 +978,36 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # send error to Telegram (very important)
         run_link = github_run_url()
         tb = traceback.format_exc()
 
-        msg = "❌ Moodle scan failed (Exception)\n"
+        msg = "❌ Moodle scan failed\n"
+        
+        # הדפסת העמוד המדויק שבו הסקריפט קרס כדי לדעת אם עקפנו את ה-WAF
+        if driver:
+            try:
+                msg += f"URL: {driver.current_url}\n"
+                msg += f"Title: {driver.title}\n\n"
+            except:
+                pass
+        
         if run_link:
             msg += f"🔗 Logs: {run_link}\n\n"
+            
         msg += tb
 
-        # Telegram has length limits; clip a bit
         if len(msg) > 3800:
             msg = msg[:3800] + "\n...\n(Traceback clipped)"
 
         telegram_send(msg)
         raise
+        
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+
+if __name__ == "__main__":
+    main()
